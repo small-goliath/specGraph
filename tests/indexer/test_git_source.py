@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 
 import pytest
@@ -43,7 +44,6 @@ async def test_hung_remote_git_times_out_with_git_source_error(tmp_path, monkeyp
 
 async def test_hung_git_with_grandchild_holding_pipes_is_killed_as_group(tmp_path, monkeypatch):
     """git-remote-https 처럼 손자 프로세스가 stdout/stderr 파이프를 쥔 경우도 제때 끝난다."""
-    import os
     import time
 
     bin_dir = tmp_path / "bin"
@@ -60,22 +60,113 @@ async def test_hung_git_with_grandchild_holding_pipes_is_killed_as_group(tmp_pat
         timeout_seconds=0.5,
     )
 
-    started = time.monotonic()
-    with pytest.raises(GitSourceError):
-        await source.list_branches()
+    with _kill_grandchild_on_exit(pid_file):  # 단언이 실패해도 손자(sleep 30)를 남기지 않는다
+        started = time.monotonic()
+        with pytest.raises(GitSourceError):
+            await source.list_branches()
 
-    assert time.monotonic() - started < 4
-    grandchild = int(pid_file.read_text(encoding="utf-8").strip())
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
+        assert time.monotonic() - started < 4
+        grandchild = int(pid_file.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 2
+        while _is_alive(grandchild):
+            if time.monotonic() >= deadline:
+                pytest.fail("손자 프로세스가 살아 있다 — 프로세스 그룹째 죽이지 않았다")
+            await asyncio.sleep(0.05)
+
+
+def _is_alive(pid: int) -> bool:
+    """살아 있는 프로세스인가. 좀비(``Z``, 아직 reap 되지 않은 종료 프로세스)는 종료로 본다.
+
+    reaper 가 없는 컨테이너나 macOS 에서는 죽은 손자가 좀비로 남아 ``os.kill(pid, 0)`` 이 계속
+    성공한다. ``/proc`` 은 macOS 에 없으므로 ``ps`` 로 상태를 읽는다.
+    """
+    import os
+    import subprocess
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+@contextlib.contextmanager
+def _kill_grandchild_on_exit(pid_file):
+    """블록이 어떻게 끝나든(단언 실패 포함) pid 파일의 프로세스가 살아 있으면 SIGKILL 한다.
+
+    pid 파일이 아직 없거나(손자가 만들어지기 전 실패) 비어 있어도 안전하다.
+    """
+    import os
+    import signal
+
+    try:
+        yield
+    finally:
         try:
-            os.kill(grandchild, 0)
-        except ProcessLookupError:
-            break
-        await asyncio.sleep(0.05)
-    else:
-        os.kill(grandchild, 9)
-        pytest.fail("손자 프로세스가 살아 있다 — 프로세스 그룹째 죽이지 않았다")
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, ValueError):
+            pid = None
+        if pid is not None and _is_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_is_alive_treats_zombie_as_dead():
+    import subprocess
+    import time
+
+    child = subprocess.Popen(["sleep", "0"])  # wait() 하지 않는다 → 종료 뒤 좀비로 남는다
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child.pid)], capture_output=True, text=True
+            ).stdout.strip()
+            if state.startswith("Z"):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("좀비를 만들지 못했다")
+
+        assert _is_alive(child.pid) is False
+    finally:
+        child.wait()
+
+
+def test_is_alive_true_for_running_process_and_false_after_reap():
+    import subprocess
+
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        assert _is_alive(child.pid) is True
+    finally:
+        child.kill()
+        child.wait()
+    assert _is_alive(child.pid) is False
+
+
+def test_grandchild_cleanup_runs_even_when_assertion_fails(tmp_path):
+    import subprocess
+
+    child = subprocess.Popen(["sleep", "30"])
+    pid_file = tmp_path / "grandchild.pid"
+    pid_file.write_text(f"{child.pid}\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError):
+        with _kill_grandchild_on_exit(pid_file):
+            raise AssertionError("검증 실패")
+
+    assert child.wait(timeout=5) == -9  # SIGKILL 로 정리됐다
+
+
+def test_grandchild_cleanup_tolerates_missing_pid_file(tmp_path):
+    with _kill_grandchild_on_exit(tmp_path / "never-created.pid"):
+        pass
 
 
 async def test_remote_git_calls_set_low_speed_abort(git_remote, tmp_path):

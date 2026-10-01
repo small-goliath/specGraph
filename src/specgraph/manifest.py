@@ -6,6 +6,13 @@ doc_id 당 1행(브랜치 HEAD 최신본)만 유지한다 — 버전 이력은 �
 커밋 SHA (결정 D6)
     ``commit_sha``          내용 해시가 확인된 최신 브랜치 HEAD(변경 없는 챕터도 갱신, LLM 0회)
     ``content_commit_sha``  그 내용이 LightRAG 에 삽입된 시점의 HEAD
+
+삽입 시작 기록 (PENDING)
+    인덱서는 LightRAG 를 건드리기 전에 ``content_hash=PENDING_HASH`` 레코드를 남긴다.
+    - 첫 삽입: 새 값을 담되 ``content_commit_sha=""`` — 한 번도 완료된 적 없어 MCP 조회에서 숨긴다
+      (``ChapterRecord.is_hidden``).
+    - 재삽입: 직전 완료본의 본문 · SHA · 화면/정책을 그대로 둔 채 해시와 kg_keys 만 바꾼다 —
+      MCP 조회에는 직전 성공 상태로 보인다.
 """
 
 from __future__ import annotations
@@ -19,6 +26,9 @@ from specgraph.kg_model import KgKeys
 
 INDEXER_LOCK_KEY = "specgraph-indexer"
 DEFAULT_SCHEMA = "specgraph"
+# 삽입을 시작했지만 끝내지 못한 챕터의 content_hash — 어떤 내용 해시와도 달라 다음 주기에
+# 다시 넣는다.
+PENDING_HASH = ""
 _SCHEMA_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 _DDL_TEMPLATE = """
@@ -78,6 +88,16 @@ class ChapterRecord:
     @property
     def document(self) -> str:
         return f"{self.branch}:{self.path}"
+
+    @property
+    def is_pending(self) -> bool:
+        """삽입을 시작했지만 완료 기록이 없다."""
+        return self.content_hash == PENDING_HASH
+
+    @property
+    def is_hidden(self) -> bool:
+        """MCP 조회에서 숨긴다 — 삽입이 한 번도 완료되지 않은 PENDING 레코드."""
+        return self.is_pending and self.content_commit_sha == ""
 
     def with_commit(self, commit_sha: str) -> ChapterRecord:
         return replace(self, commit_sha=commit_sha)

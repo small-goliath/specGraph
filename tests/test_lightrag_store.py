@@ -649,3 +649,233 @@ async def test_drop_workspace_empties_every_storage(store):
 
     assert await store.rag.aget_docs_by_ids([DOC]) == {}
     assert await store.entity_names() == []
+
+
+async def test_real_lightrag_shared_screen_keeps_other_chapter_file_path_after_reinsert(store):
+    """R3-C1 (AC8): A · B 가 같은 화면을 참조하고 A 만 재삽입해도 file_path 에 B 가 남는다."""
+    graph = store.rag.chunk_entity_relation_graph
+    a_first = _payload(OTHER, "## 2. PTN-P-04 정산 조회\nPTN-P-04 화면")
+    a_again = _payload(OTHER, "## 2. PTN-P-04 정산 조회\nPTN-P-04 화면 (개정)")
+    b = _payload(PARTNER3, "## 3. 이력\nPTN-P-04 에서 이동")
+    await store.upsert_chapter_kg(a_first, previous=None)
+    await store.upsert_chapter_kg(b, previous=None)
+
+    await store.delete_chapter(OTHER)
+    await store.insert_chapter(OTHER, ["## 2. PTN-P-04 정산 조회\nPTN-P-04 화면 (개정)"])
+    await store.upsert_chapter_kg(a_again, previous=a_first.keys)
+
+    node = await graph.get_node("PTN-P-04")
+    assert PARTNER3 in decode_sources(node["file_path"])
+    assert OTHER in decode_sources(node["file_path"])
+    assert _anchor_id(b.keys.anchor_content) in _sep(node["source_id"])
+
+
+def _anchor_id(content):
+    from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding
+
+    return compute_mdhash_id(sanitize_text_for_encoding(content), prefix="chunk-")
+
+
+async def test_real_lightrag_shared_node_restore_makes_zero_llm_calls(settings_env, tmp_path):
+    """R3-C1 (AC9): 공유 노드 출처 복원(재삽입의 KG 단계)은 LLM 을 부르지 않는다."""
+    calls: list[str] = []
+
+    async def counting_llm(prompt: str, system_prompt: str | None = None, **_: object) -> str:
+        calls.append(prompt)
+        return ""
+
+    from lightrag.utils import Tokenizer
+
+    real = await _create_store(
+        settings_env,
+        tmp_path / "rag-shared",
+        llm_model_func=counting_llm,
+        tokenizer=Tokenizer("char", CharTokenizer()),
+    )
+    a_first = _payload(OTHER, "## 2. PTN-P-04 정산 조회\nPTN-P-04 화면")
+    a_again = _payload(OTHER, "## 2. PTN-P-04 정산 조회\nPTN-P-04 화면 (개정)")
+    b = _payload(PARTNER3, "## 3. 이력\nPTN-P-04 에서 이동")
+    try:
+        await real.upsert_chapter_kg(a_first, previous=None)
+        await real.upsert_chapter_kg(b, previous=None)
+        before = len(calls)
+
+        await real.upsert_chapter_kg(a_again, previous=a_first.keys)
+
+        node = await real.rag.chunk_entity_relation_graph.get_node("PTN-P-04")
+        assert PARTNER3 in decode_sources(node["file_path"])
+    finally:
+        await real.close()
+    assert len(calls) - before == 0
+
+
+# --- 삭제 결과 전파 (R3-C2 · AC6) ----------------------------------------------------------
+
+
+class _DeleteStubRag:
+    """adelete_by_relation / adelete_by_entity 가 status 로 결과를 돌려주는 스텁."""
+
+    def __init__(self, statuses: dict[tuple, list[str]] | None = None) -> None:
+        self._statuses = statuses or {}
+        self.relation_calls: list[tuple[str, str]] = []
+        self.entity_calls: list[str] = []
+
+    def _next(self, key: tuple) -> object:
+        from types import SimpleNamespace
+
+        queue = self._statuses.get(key)
+        status = queue.pop(0) if queue else "success"
+        return SimpleNamespace(status=status, message=f"stub {status}")
+
+    async def adelete_by_relation(self, src, tgt):
+        self.relation_calls.append((src, tgt))
+        return self._next(("relation", src, tgt))
+
+    async def adelete_by_entity(self, name):
+        self.entity_calls.append(name)
+        return self._next(("entity", name))
+
+
+def _keys(relations, chapter="CH"):
+    from specgraph.kg_model import KgKeys
+
+    return KgKeys(chapter, tuple(relations), "anchor")
+
+
+async def test_remove_relation_fail_status_raises_indexing_error():
+    from specgraph.errors import IndexingError
+
+    rag = _DeleteStubRag({("relation", "a", "b"): ["fail"]})
+
+    with pytest.raises(IndexingError):
+        await LightRagStore(rag)._remove_relations([("a", "b")])
+
+
+async def test_remove_relation_not_found_is_treated_as_success():
+    rag = _DeleteStubRag({("relation", "a", "b"): ["not_found"]})
+
+    await LightRagStore(rag)._remove_relations([("a", "b"), ("c", "d")])
+
+    assert rag.relation_calls == [("a", "b"), ("c", "d")]
+
+
+async def test_remove_relation_not_allowed_status_raises_indexing_error():
+    from specgraph.errors import IndexingError
+
+    rag = _DeleteStubRag({("relation", "a", "b"): ["not_allowed"]})
+
+    with pytest.raises(IndexingError):
+        await LightRagStore(rag)._remove_relations([("a", "b")])
+
+
+async def test_delete_entity_fail_status_raises_indexing_error():
+    from specgraph.errors import IndexingError
+
+    rag = _DeleteStubRag({("entity", "P-1"): ["fail"]})
+
+    with pytest.raises(IndexingError):
+        await LightRagStore(rag).delete_entities(["P-1"])
+
+
+async def test_delete_entity_not_found_is_treated_as_success():
+    rag = _DeleteStubRag({("entity", "P-1"): ["not_found"]})
+
+    await LightRagStore(rag).delete_entities(["P-1", "P-2"])
+
+    assert rag.entity_calls == ["P-1", "P-2"]
+
+
+async def test_delete_chapter_kg_fail_status_raises_indexing_error():
+    from specgraph.errors import IndexingError
+
+    rag = _DeleteStubRag({("entity", "CH"): ["fail"]})
+    store = LightRagStore(rag)
+
+    async def no_detach(*_args, **_kwargs):
+        return None
+
+    store._detach = no_detach  # 이 테스트는 삭제 결과 처리만 본다
+
+    with pytest.raises(IndexingError):
+        await store.delete_chapter_kg(_keys([]))
+
+
+async def test_partial_relation_delete_retry_is_idempotent():
+    """첫 시도는 두 번째 관계에서 실패하고, 재시도는 이미 지운 첫 관계를 not_found 로 통과한다."""
+    from specgraph.errors import IndexingError
+
+    rag = _DeleteStubRag({("relation", "c", "d"): ["fail"], ("relation", "a", "b"): ["success"]})
+    store = LightRagStore(rag)
+    relations = [("a", "b"), ("c", "d")]
+
+    with pytest.raises(IndexingError):
+        await store._remove_relations(relations)
+    rag._statuses[("relation", "a", "b")] = ["not_found"]
+    await store._remove_relations(relations)
+
+    assert rag.relation_calls == [("a", "b"), ("c", "d"), ("a", "b"), ("c", "d")]
+
+
+async def test_real_lightrag_intermediate_anchor_chunk_leaves_no_trace_in_chunks_and_node_source_id(
+    store,
+):
+    """R3-C3 (AC10): 삽입 실패 뒤 내용이 또 바뀌어도 중간 앵커 청크가 어디에도 남지 않는다."""
+    from specgraph.kg_model import KgKeys
+
+    graph = store.rag.chunk_entity_relation_graph
+    v0 = _payload(OTHER, "## 2. PTN-P-04 정산 조회\nPTN-P-04 화면")
+    v1 = _payload(OTHER, "## 2. PTN-P-04 정산 조회 (중간)\nPTN-P-04 화면")
+    v2 = _payload(OTHER, "## 2. PTN-P-04 정산 조회 (최종)\nPTN-P-04 화면")
+    shared = _payload(PARTNER3, "## 3. 이력\nPTN-P-04 에서 이동")
+    await store.upsert_chapter_kg(shared, previous=None)
+    await store.upsert_chapter_kg(v0, previous=None)
+    # 시도 1: KG 는 들어갔지만 manifest 완료 기록이 실패 → PENDING 이 중간 앵커를 stale 로 기억한다.
+    await store.upsert_chapter_kg(v1, previous=v0.keys)
+    pending = KgKeys(
+        OTHER,
+        tuple(dict.fromkeys((*v0.keys.relations, *v1.keys.relations))),
+        v0.keys.anchor_content,
+        stale_anchors=(v1.keys.anchor_content,),
+    )
+
+    await store.upsert_chapter_kg(v2, previous=pending)
+
+    intermediate = _anchor_id(v1.keys.anchor_content)
+    assert await store.rag.text_chunks.get_by_id(intermediate) is None
+    assert await store.rag.chunks_vdb.get_by_id(intermediate) is None
+    node = await graph.get_node("PTN-P-04")
+    assert intermediate not in _sep(node["source_id"])
+    assert _anchor_id(v2.keys.anchor_content) in _sep(node["source_id"])
+    assert _anchor_id(shared.keys.anchor_content) in _sep(node["source_id"])
+
+
+def test_undirected_normalizes_pair_order():
+    from specgraph.lightrag_store import undirected
+
+    assert undirected(("b", "a")) == undirected(("a", "b")) == ("a", "b")
+
+
+def test_undirected_is_idempotent():
+    from specgraph.lightrag_store import undirected
+
+    once = undirected(("z", "a"))
+
+    assert undirected(once) == once
+    assert undirected(reversed(once)) == once
+
+
+async def test_real_lightrag_kg_upsert_keeps_shared_edge_when_keep_is_reverse_direction(store):
+    """R3-T2 (AC12): keep 을 관계의 역방향 (b, a) 로 넘겨도 공유 엣지를 지우지 않는다."""
+    a = "draft/x-prd:prd/x-prd.md#1"
+    b = "draft/x-prd:prd/x-prd.md#2"
+    graph = store.rag.chunk_entity_relation_graph
+    docs = [DocumentRef("draft/x-prd", "prd/x-prd.md")]
+    a_refs_b = _payload(a, "## 1. 하나\n§2 참고", docs)
+    b_refs_a = _payload(b, "## 2. 둘\n§1 참고", docs)
+    a_alone = _payload(a, "## 1. 하나\n참조 없음", docs)
+    await store.upsert_chapter_kg(a_refs_b, previous=None)
+    await store.upsert_chapter_kg(b_refs_a, previous=None)
+
+    await store.upsert_chapter_kg(a_alone, previous=a_refs_b.keys, keep=frozenset({(b, a)}))
+
+    assert await graph.has_edge(a, b)

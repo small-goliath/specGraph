@@ -660,3 +660,137 @@ async def test_git_listing_failure_returns_without_changes(tmp_path):
     assert result.error is not None
     assert manifest.heads == {"draft/a": "x"}
     assert rag.calls == []
+
+
+async def test_relation_delete_failure_keeps_manifest_kg_keys_and_retries_next_poll(env, docs):
+    """R3-C2 (AC7): 관계 삭제가 실패한 챕터의 완료 kg_keys 는 바뀌지 않고, 다음 주기에 정리된다."""
+    remote, service, rag, manifest, _ = env
+    await service.poll_once()
+    completed = manifest.records[PARTNER2].kg_keys
+    assert rag.has_edge(PARTNER2, "PTN-P-04")
+    remote.commit(PARTNER_BRANCH, {PARTNER_PATH: docs["partner"].replace("PTN-P-04", "PTN-P-05")})
+    rag.fail_relation_delete_once = True
+
+    first = await service.poll_once()
+
+    assert list(first.failed) == [PARTNER_BRANCH]
+    pending = manifest.records[PARTNER2]
+    assert pending.content_hash == ""  # 완료 기록이 아니다
+    assert set(completed.relations) <= set(pending.kg_keys.relations)  # 옛 관계를 계속 기억한다
+    assert rag.has_edge(PARTNER2, "PTN-P-04")
+    assert manifest.heads[PARTNER_BRANCH] != remote.shas[PARTNER_BRANCH]  # HEAD 미갱신
+
+    second = await service.poll_once()
+
+    assert second.failed == {}
+    assert not rag.has_edge(PARTNER2, "PTN-P-04")
+    assert rag.has_edge(PARTNER2, "PTN-P-05")
+    assert manifest.records[PARTNER2].content_hash
+
+
+async def test_reconcile_refs_relation_delete_failure_leaves_kg_keys_unchanged(
+    git_remote, tmp_path, docs, caplog
+):
+    """R3-C2 (AC7): 참조 재해석 중 관계 삭제가 실패하면 그 kg_keys 는 그대로고 재시도된다."""
+    remote, service, rag, manifest, billing = _three_branch_env(git_remote, tmp_path, docs)
+    await service.poll_once()  # admin 문서가 아직 없다 → 참조 미해석
+    before = {d: r.kg_keys for d, r in manifest.records.items()}
+    remote.commit(ADMIN_BRANCH, {ADMIN_PATH: docs["admin"]})
+    rag.fail_relation_delete_once = True
+    caplog.set_level(logging.INFO)
+
+    second = await service.poll_once()
+
+    assert second.failed == {}
+    failed = [r for r in caplog.records if "event=cross_ref_reconcile_failed" in r.getMessage()]
+    assert len(failed) == 1
+    failed_doc = _field(failed[0].getMessage(), "doc_id")
+    assert manifest.records[failed_doc].kg_keys == before[failed_doc]
+
+    third = await service.poll_once()  # 변경 없음 — 그래도 실패분을 다시 해석한다
+
+    assert third.failed == {}
+    assert manifest.records[failed_doc].kg_keys != before[failed_doc]
+    assert rag.has_edge(PARTNER2, ADMIN5)
+
+
+async def test_reinsert_failure_keeps_previous_content_and_shas_in_manifest(env, docs):
+    """R3-C4 (AC2): 재삽입 시작 기록이 직전 완료본의 본문 · SHA 를 덮어쓰지 않는다."""
+    from specgraph.mcp_server.lookup import LookupService
+
+    remote, service, rag, manifest, _ = env
+    await service.poll_once()
+    done = manifest.records[ADMIN5]
+    remote.commit(ADMIN_BRANCH, {ADMIN_PATH: docs["admin"].replace("D+2 이며", "D+3 이며")})
+    rag.fail_once.add(ADMIN5)
+
+    result = await service.poll_once()
+
+    assert list(result.failed) == [ADMIN_BRANCH]
+    pending = manifest.records[ADMIN5]
+    assert pending.content_hash == ""
+    assert pending.content == done.content
+    assert pending.commit_sha == done.commit_sha
+    assert pending.content_commit_sha == done.content_commit_sha
+    assert pending.screens == done.screens and pending.policies == done.policies
+    assert pending.is_pending and not pending.is_hidden
+    shown = await LookupService(manifest).get_chapter(f"{ADMIN_BRANCH}:{ADMIN_PATH}", "5")
+    assert shown["content"] == done.content and shown["commit_sha"] == done.commit_sha
+
+
+async def test_first_insert_pending_record_is_hidden_without_content_commit_sha(env):
+    """R3-C4 (AC1): 첫 삽입 시작 기록은 content_commit_sha 가 비어 숨김 대상이 된다."""
+    from specgraph.mcp_server.lookup import LookupService
+
+    _, service, rag, manifest, _ = env
+    target = f"{PARTNER_BRANCH}:{PARTNER_PATH}#2"
+    rag.fail_once.add(target)
+
+    await service.poll_once()
+
+    pending = manifest.records[target]
+    assert pending.is_pending and pending.content_commit_sha == ""
+    assert pending.is_hidden
+    listed = await LookupService(manifest).list_docs()
+    shown = {c["doc_id"] for b in listed["branches"] for d in b["documents"] for c in d["chapters"]}
+    assert target not in shown
+
+
+async def test_insert_failure_then_content_change_retry_deletes_intermediate_anchor_chunk(
+    env, docs
+):
+    """R3-C3 (AC10): 완료 기록이 실패한 시도의 앵커 청크가, 내용이 또 바뀐 재시도에서 지워진다."""
+    remote, service, rag, manifest, _ = env
+    await service.poll_once()
+    manifest.fail_commit_upsert_once.add(PARTNER2)
+    remote.commit(PARTNER_BRANCH, {PARTNER_PATH: docs["partner"].replace("PTN-P-04", "PTN-P-05")})
+    first = await service.poll_once()
+    assert list(first.failed) == [PARTNER_BRANCH]
+    assert len(rag.anchors[PARTNER2]) == 1  # 중간 시도의 앵커
+
+    remote.commit(PARTNER_BRANCH, {PARTNER_PATH: docs["partner"].replace("PTN-P-04", "PTN-P-06")})
+    second = await service.poll_once()
+
+    assert second.failed == {}
+    final = manifest.records[PARTNER2].kg_keys
+    assert rag.anchors[PARTNER2] == {final.anchor_content}
+    assert final.stale_anchors == ()
+
+
+async def test_mutual_reference_edge_survives_reinsert_of_second_chapter(git_remote, tmp_path):
+    """R3-T2 (AC12): 챕터 2 쪽(역방향 소유자)을 다시 넣어도 챕터 1 소유 엣지는 남는다."""
+    remote = git_remote()
+    path = "prd/settlr-m-prd.md"
+    branch = "draft/settlr-m-prd"
+    ch1, ch2 = f"{branch}:{path}#1", f"{branch}:{path}#2"
+    remote.commit(branch, {path: "## 1. 하나\n§2 참고\n\n## 2. 둘\n§1 참고\n"})
+    counter = LlmCallCounter()
+    rag = FakeLightRAG(counter=counter)
+    service = _service(remote, tmp_path, rag, InMemoryManifest(), counter)
+    await service.poll_once()
+    assert rag.has_edge(ch1, ch2)
+
+    remote.commit(branch, {path: "## 1. 하나\n§2 참고\n\n## 2. 둘\n참조 없음\n"})
+    await service.poll_once()
+
+    assert rag.has_edge(ch1, ch2)

@@ -31,6 +31,14 @@ class KgKeys:
     chapter_entity: str
     relations: tuple[tuple[str, str], ...]
     anchor_content: str
+    # 삽입 시도 중 만들었지만 완료 기록에 이르지 못한 앵커 청크 내용 — PENDING 에서만 값이 있다.
+    # 다음 시도가 ``anchor_content`` 와 함께 지워, 중간 시도의 청크가 누적되지 않게 한다.
+    stale_anchors: tuple[str, ...] = ()
+
+    @property
+    def all_anchors(self) -> tuple[str, ...]:
+        """이 레코드가 기억하는 모든 앵커 청크 내용(현재 + 중간 시도)."""
+        return tuple(dict.fromkeys((self.anchor_content, *self.stale_anchors)))
 
     def to_json(self) -> str:
         return json.dumps(
@@ -38,6 +46,7 @@ class KgKeys:
                 "chapter_entity": self.chapter_entity,
                 "relations": [list(r) for r in self.relations],
                 "anchor_content": self.anchor_content,
+                "stale_anchors": list(self.stale_anchors),
             },
             ensure_ascii=False,
         )
@@ -49,6 +58,7 @@ class KgKeys:
             chapter_entity=data["chapter_entity"],
             relations=tuple((src, tgt) for src, tgt in data["relations"]),
             anchor_content=data["anchor_content"],
+            stale_anchors=tuple(data.get("stale_anchors") or ()),
         )
 
 

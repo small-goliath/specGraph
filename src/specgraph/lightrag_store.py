@@ -265,6 +265,18 @@ def _anchor_chunk_id(anchor_content: str) -> str:
     return compute_mdhash_id(sanitize_text_for_encoding(anchor_content), prefix="chunk-")
 
 
+def _ensure_deleted(result: Any, what: str) -> None:
+    """LightRAG 삭제 결과(``DeletionResult``)가 success · not_found 가 아니면 실패로 올린다.
+
+    LightRAG 는 삭제 실패를 예외 대신 ``status="fail"`` 로 돌려준다. 삼키면 재시도 경로가
+    실패를 알 수 없어 엣지 · 엔티티가 영구 고아로 남는다. not_found 는 이미 지워진 것이므로
+    정상(재시도 멱등)이다.
+    """
+    status = getattr(result, "status", None)
+    if status not in ("success", "not_found"):
+        raise IndexingError(f"LightRAG 삭제 실패 {what}: status={status} {result.message}")
+
+
 def _status_fields(status: Any) -> tuple[str | None, str | None]:
     """doc status 는 스토리지에 따라 dict 또는 DocProcessingStatus 로 온다."""
     if status is None:
@@ -363,9 +375,7 @@ class LightRagStore:
             raise IndexingError(f"LightRAG 삽입 실패 doc_id={doc_id} status={state} error={error}")
 
     async def delete_chapter(self, doc_id: str) -> None:
-        result = await self.rag.adelete_by_doc_id(doc_id)
-        if result.status not in ("success", "not_found"):
-            raise IndexingError(f"LightRAG 삭제 실패 doc_id={doc_id}: {result.message}")
+        _ensure_deleted(await self.rag.adelete_by_doc_id(doc_id), f"doc_id={doc_id}")
 
     async def _remove_relations(
         self, relations: Iterable[RelationPair], keep: frozenset[RelationPair] = frozenset()
@@ -373,19 +383,22 @@ class LightRagStore:
         kept = {undirected(pair) for pair in keep}
         for src, tgt in relations:
             if undirected((src, tgt)) not in kept:
-                await self.rag.adelete_by_relation(src, tgt)
+                _ensure_deleted(
+                    await self.rag.adelete_by_relation(src, tgt), f"relation={src}~{tgt}"
+                )
 
-    async def _delete_anchor_chunk(self, anchor_content: str) -> None:
-        chunk_id = _anchor_chunk_id(anchor_content)
-        await self.rag.chunks_vdb.delete([chunk_id])
-        await self.rag.text_chunks.delete([chunk_id])
+    async def _delete_anchor_chunks(self, anchors: Iterable[str]) -> None:
+        chunk_ids = [_anchor_chunk_id(a) for a in dict.fromkeys(anchors)]
+        if chunk_ids:
+            await self.rag.chunks_vdb.delete(chunk_ids)
+            await self.rag.text_chunks.delete(chunk_ids)
 
     async def _detach(self, keys: KgKeys, names: Iterable[str]) -> None:
         """공유 노드에서 이 챕터의 앵커 청크 · file_path 만 뺀다(다른 출처가 남은 노드만).
 
         이 챕터만 출처인 노드는 건드리지 않는다 — 고아 엔티티 정리(서비스)가 지운다.
         """
-        chunk_id = _anchor_chunk_id(keys.anchor_content)
+        chunk_ids = {_anchor_chunk_id(a) for a in keys.all_anchors}
         own_path = encode_source(keys.chapter_entity)
         graph = self.rag.chunk_entity_relation_graph
         for name in sorted(set(names)):
@@ -394,7 +407,7 @@ class LightRagStore:
                 continue
             sources = _split_field(node.get("source_id"))
             paths = _split_field(node.get("file_path"))
-            rest_sources = [s for s in sources if s != chunk_id]
+            rest_sources = [s for s in sources if s not in chunk_ids]
             rest_paths = [p for p in paths if p != own_path]
             if (rest_sources == sources and rest_paths == paths) or not rest_sources:
                 continue
@@ -447,9 +460,10 @@ class LightRagStore:
             await self._remove_relations(previous.relations, keep)
             dropped = {t for _, t in previous.relations} - {t for _, t in keys.relations}
             await self._detach(previous, dropped)
-            if previous.anchor_content != keys.anchor_content:
-                await self._delete_anchor_chunk(previous.anchor_content)
-                stale_chunks.add(_anchor_chunk_id(previous.anchor_content))
+            # 완료 앵커를 뺀 모든 이전 앵커(직전 완료본 + 중간 시도들)의 청크를 지운다.
+            old_anchors = [a for a in previous.all_anchors if a != keys.anchor_content]
+            await self._delete_anchor_chunks(old_anchors)
+            stale_chunks.update(_anchor_chunk_id(a) for a in old_anchors)
         graph = self.rag.chunk_entity_relation_graph
         existing: dict[str, dict[str, Any]] = {}
         for entity in payload.custom_kg["entities"]:
@@ -464,12 +478,14 @@ class LightRagStore:
     async def delete_chapter_kg(self, keys: KgKeys) -> None:
         await self._remove_relations(keys.relations)
         await self._detach(keys, (t for _, t in keys.relations))
-        await self.rag.adelete_by_entity(keys.chapter_entity)
-        await self._delete_anchor_chunk(keys.anchor_content)
+        _ensure_deleted(
+            await self.rag.adelete_by_entity(keys.chapter_entity), f"entity={keys.chapter_entity}"
+        )
+        await self._delete_anchor_chunks(keys.all_anchors)
 
     async def delete_entities(self, names: list[str]) -> None:
         for name in names:
-            await self.rag.adelete_by_entity(name)
+            _ensure_deleted(await self.rag.adelete_by_entity(name), f"entity={name}")
 
     async def entity_names(self) -> list[str]:
         return list(await self.rag.chunk_entity_relation_graph.get_all_labels())

@@ -149,3 +149,86 @@ async def test_list_docs_branch_commit_sha_comes_from_branch_head():
 async def test_unknown_id_raises_not_found(lookup, call):
     with pytest.raises(NotFoundError):
         await call(lookup)
+
+
+PENDING_PATH = "prd/pending.md"
+
+
+def _pending(section, *, content_commit_sha, content="## 새 본문", commit_sha="sha-new", **kw):
+    """삽입 시작 기록(PENDING). content_commit_sha 가 비면 한 번도 완료되지 않은 첫 삽입이다."""
+    doc_id = f"{ADMIN_BRANCH}:{PENDING_PATH}#{section}"
+    return ChapterRecord(
+        doc_id=doc_id,
+        branch=ADMIN_BRANCH,
+        path=PENDING_PATH,
+        section=section,
+        title=f"{section}. 대기",
+        content=content,
+        content_hash="",
+        commit_sha=commit_sha,
+        content_commit_sha=content_commit_sha,
+        **kw,
+    )
+
+
+async def test_list_docs_hides_first_insert_pending_chapter(lookup):
+    record = _pending("1", content_commit_sha="")
+    lookup.manifest.records[record.doc_id] = record
+
+    result = await lookup.list_docs()
+
+    paths = {d["path"] for b in result["branches"] for d in b["documents"]}
+    assert PENDING_PATH not in paths
+
+
+async def test_get_chapter_hides_first_insert_pending_chapter(lookup):
+    record = _pending("1", content_commit_sha="")
+    lookup.manifest.records[record.doc_id] = record
+
+    with pytest.raises(NotFoundError):
+        await lookup.get_chapter(f"{ADMIN_BRANCH}:{PENDING_PATH}", "1")
+
+
+async def test_find_screen_hides_first_insert_pending_chapter(lookup):
+    record = _pending("1", content_commit_sha="", screens={"PND-01": 0})
+    lookup.manifest.records[record.doc_id] = record
+
+    with pytest.raises(NotFoundError):
+        await lookup.find_screen("PND-01")
+
+
+async def test_find_policy_hides_first_insert_pending_chapter(lookup):
+    record = _pending("1", content_commit_sha="", policies={"P-99.9": 0})
+    lookup.manifest.records[record.doc_id] = record
+
+    with pytest.raises(NotFoundError):
+        await lookup.find_policy("P-99.9")
+
+
+async def test_find_screen_skips_pending_definition_and_falls_back_to_visible_mention(lookup):
+    """첫 삽입 PENDING 이 정의 챕터여도 숨기고, 보이는 다른 챕터(언급)를 돌려준다."""
+    record = _pending("1", content_commit_sha="", screens={"ADM-03": 0})
+    lookup.manifest.records[record.doc_id] = record
+
+    result = await lookup.find_screen("ADM-03")
+
+    assert result["doc_id"] == f"{ADMIN_BRANCH}:prd/settlr-admin-prd.md#3"
+    assert record.doc_id not in result["mentioned_in"]
+
+
+async def test_get_chapter_shows_previous_completed_content_while_reinserting(lookup):
+    """AC2: 재삽입 중 PENDING 은 직전 성공본의 본문 · commit_sha 로 보인다."""
+    record = _pending(
+        "1",
+        content_commit_sha="sha-done",
+        content="## 1. 직전 완료본",
+        commit_sha="sha-done",
+    )
+    lookup.manifest.records[record.doc_id] = record
+
+    result = await lookup.get_chapter(f"{ADMIN_BRANCH}:{PENDING_PATH}", "1")
+    listed = await lookup.list_docs()
+
+    assert result["content"] == "## 1. 직전 완료본" and result["commit_sha"] == "sha-done"
+    docs = {d["path"]: d for b in listed["branches"] for d in b["documents"]}
+    assert docs[PENDING_PATH]["chapters"][0]["commit_sha"] == "sha-done"

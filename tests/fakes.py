@@ -46,6 +46,9 @@ class FakeLightRAG:
     fail_kg_once: set[str] = field(default_factory=set)
     fail_merge_once: bool = False
     fail_entity_delete_once: bool = False
+    # 이전 관계를 지우는 단계(어댑터의 adelete_by_relation 이 status=fail 을 돌려주는 경우)를 한 번
+    # 실패시킨다. 실패하면 그 호출은 그래프를 바꾸지 않는다.
+    fail_relation_delete_once: bool = False
     extracted_entities: set[str] = field(default_factory=set)
     retrieval: Retrieval | None = None
 
@@ -54,6 +57,8 @@ class FakeLightRAG:
     statuses: dict[str, str] = field(default_factory=dict)
     kg: dict[str, KgPayload] = field(default_factory=dict)
     kg_entities: set[str] = field(default_factory=set)
+    # 챕터 엔티티 → 지금 LightRAG 에 있는 앵커 청크 내용(실제 어댑터의 청크 정리를 모델링)
+    anchors: dict[str, set[str]] = field(default_factory=dict)
     edges: set[RelationPair] = field(default_factory=set)
     merges: list[tuple[list[str], str]] = field(default_factory=list)
 
@@ -100,11 +105,22 @@ class FakeLightRAG:
         if self._should_fail_kg(payload.keys.chapter_entity):
             raise IndexingError(f"fake: custom KG upsert failed {payload.keys.chapter_entity}")
         kept = {undirected(p) for p in keep}
+        if (
+            self.fail_relation_delete_once
+            and previous is not None
+            and any(undirected(p) not in kept for p in previous.relations)
+        ):
+            self.fail_relation_delete_once = False
+            raise IndexingError(f"fake: relation delete failed {payload.keys.chapter_entity}")
         if previous is not None:
             for pair in previous.relations:
                 if undirected(pair) not in kept:
                     self.edges.discard(undirected(pair))
         self.edges.update(undirected(pair) for pair in payload.keys.relations)
+        mine = self.anchors.setdefault(payload.keys.chapter_entity, set())
+        if previous is not None:
+            mine.difference_update({*previous.all_anchors})
+        mine.add(payload.keys.anchor_content)
         self.kg[payload.keys.chapter_entity] = payload
         for entity in payload.custom_kg["entities"]:
             self.kg_entities.add(entity["entity_name"])
@@ -113,6 +129,7 @@ class FakeLightRAG:
         self.calls.append(("delete_kg", keys.chapter_entity))
         self.edges = {e for e in self.edges if keys.chapter_entity not in e}
         self.kg.pop(keys.chapter_entity, None)
+        self.anchors.pop(keys.chapter_entity, None)
         self.kg_entities.discard(keys.chapter_entity)
 
     def _should_fail_kg(self, chapter: str) -> bool:

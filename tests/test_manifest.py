@@ -64,3 +64,34 @@ async def test_drop_schema_drops_own_schema():
     await manifest.drop_schema()
 
     assert pool.executed == ["DROP SCHEMA IF EXISTS itest_abc CASCADE"]
+
+
+def _record(content_hash: str, content_commit_sha: str) -> ChapterRecord:
+    return ChapterRecord(
+        doc_id="draft/a:prd/a.md#1",
+        branch="draft/a",
+        path="prd/a.md",
+        section="1",
+        title="1. A",
+        content="c",
+        content_hash=content_hash,
+        commit_sha="s1",
+        content_commit_sha=content_commit_sha,
+    )
+
+
+def test_pending_hash_is_shared_constant_and_matches_empty_hash():
+    from specgraph.manifest import PENDING_HASH
+
+    assert _record(PENDING_HASH, "s1").is_pending
+    assert not _record("hash", "s1").is_pending
+
+
+def test_chapter_record_is_hidden_only_when_pending_and_never_completed():
+    first_insert = _record("", "")  # 첫 삽입 시작 기록: 완료된 적이 없다
+    reinsert = _record("", "s0")  # 재삽입 시작 기록: 직전 완료본의 SHA 를 유지한다
+    completed = _record("hash", "s1")
+
+    assert first_insert.is_hidden is True
+    assert reinsert.is_hidden is False
+    assert completed.is_hidden is False

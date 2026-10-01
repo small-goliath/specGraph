@@ -112,19 +112,20 @@ class QueryService:
         records: dict[str, ChapterRecord] = {}
         for doc_id in retrieved_ids:
             record = await self.manifest.get_chapter(doc_id)
-            if record is not None:
+            if record is not None and not record.is_hidden:
                 records[doc_id] = record
 
         expanded: list[str] = []
         for doc_id in list(records):
-            keys = records[doc_id].kg_keys
+            # PENDING 의 kg_keys 는 옛 · 새 시도의 관계를 합친 값이라 참조 확장에 쓰지 않는다.
+            keys = None if records[doc_id].is_pending else records[doc_id].kg_keys
             for _, target in keys.relations if keys else ():
                 if target in records or target in expanded or not _is_chapter_id(target):
                     continue
                 if branch is not None and not belongs_to_branch(target, branch):
                     continue
                 record = await self.manifest.get_chapter(target)
-                if record is not None:
+                if record is not None and not record.is_hidden:
                     expanded.append(target)
                     records[target] = record
 

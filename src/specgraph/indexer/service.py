@@ -17,9 +17,10 @@ HEAD 가 없어도 manifest 에 챕터가 남은 브랜치(부분 실패)는 "�
 지워지면 삭제하고 남아 있으면 다시 동기화한다.
 
 챕터 삽입은 LightRAG 를 건드리기 **전에** manifest 에 시작 기록(``content_hash`` 가 빈 PENDING
-레코드, 이전 · 새 KG 관계를 합친 kg_keys)을 남긴다. 그래서 LightRAG 삽입이 FAILED 로 끝나거나
-manifest 완료 기록이 실패해도, 다음 주기에 그 챕터를 다시 넣으면서 남은 문서 · 관계를 지우고,
-브랜치가 지워지면 함께 정리된다.
+레코드, 이전 · 새 KG 관계를 합친 kg_keys)을 남긴다. 재삽입의 시작 기록은 직전 완료본의 본문 ·
+SHA 를 유지하고, 첫 삽입의 시작 기록은 ``content_commit_sha=""`` 로 MCP 조회에서 숨긴다.
+그래서 LightRAG 삽입이 FAILED 로 끝나거나 manifest 완료 기록이 실패해도, 다음 주기에 그 챕터를
+다시 넣으면서 남은 문서 · 관계를 지우고, 브랜치가 지워지면 함께 정리된다.
 
 LLM 호출은 원인 챕터 doc_id 에 귀속한다(고아 엔티티 삭제는 그 엔티티를 소유했던 챕터). 그래서
 ``sync_done llm_calls_total`` 은 그 브랜치 ``chapter_sync`` ``llm_calls`` 의 합과 같다.
@@ -49,16 +50,13 @@ from specgraph.kg_model import KgKeys
 from specgraph.lightrag_store import LightRagPort, RelationPair, undirected
 from specgraph.llm import LlmCallCounter
 from specgraph.log import log_event
-from specgraph.manifest import ChapterRecord, ManifestPort
+from specgraph.manifest import PENDING_HASH, ChapterRecord, ManifestPort
 from specgraph.settings import DEFAULT_INCLUDE_DIRS
 
 logger = logging.getLogger(__name__)
 
 # HEAD 기록 없이 manifest 에 챕터만 남은 브랜치(부분 실패)의 known HEAD — 어떤 SHA 와도 다르다.
 PARTIAL_HEAD = ""
-# 삽입을 시작했지만 끝내지 못한 챕터의 content_hash — 어떤 내용 해시와도 달라 다음 주기에
-# 다시 넣는다.
-PENDING_HASH = ""
 # 용어 병합(amerge_entities)의 LLM 호출 귀속 키 — 챕터 doc_id 가 아니다.
 GLOSSARY_MERGE_OWNER = "glossary_merge"
 
@@ -312,13 +310,7 @@ class IndexerService:
         previous_keys = previous.kg_keys if previous else None
         # 시작 기록: 여기서부터 실패하면 다음 주기에 이 챕터를 다시 넣고(이전 · 새 관계를 지운 뒤),
         # 브랜치가 지워지면 LightRAG 문서와 함께 정리된다.
-        await self.manifest.upsert_chapter(
-            replace(
-                record,
-                content_hash=PENDING_HASH,
-                kg_keys=_pending_keys(previous_keys, payload.keys),
-            )
-        )
+        await self.manifest.upsert_chapter(_start_record(record, previous, payload.keys))
         # LightRAG 는 같은 id 재삽입을 무시하므로 먼저 지운다(없으면 not_found).
         await self.rag.delete_chapter(doc_id)
         await self.rag.insert_chapter(doc_id, split_blocks(chapter.text, self.max_block_chars))
@@ -500,12 +492,36 @@ def _traceback_for(exc: BaseException) -> BaseException | None:
     return None if isinstance(exc, SpecGraphError) else exc
 
 
+def _start_record(
+    record: ChapterRecord, previous: ChapterRecord | None, new_keys: KgKeys
+) -> ChapterRecord:
+    """삽입 시작 기록(PENDING).
+
+    직전에 완료된 레코드가 있으면(재삽입) 그 본문 · SHA · 화면/정책을 유지해 MCP 조회가 직전
+    성공 상태를 계속 보이게 한다. 완료된 적이 없으면(첫 삽입, 또는 첫 삽입 재시도) 새 값을
+    담되 ``content_commit_sha`` 를 비워 숨김 대상으로 만든다.
+    """
+    keys = _pending_keys(previous.kg_keys if previous else None, new_keys)
+    if previous is not None and not previous.is_hidden:
+        return replace(previous, content_hash=PENDING_HASH, kg_keys=keys)
+    return replace(record, content_hash=PENDING_HASH, content_commit_sha="", kg_keys=keys)
+
+
 def _pending_keys(previous: KgKeys | None, new: KgKeys) -> KgKeys:
-    """시작 기록의 kg_keys — 다음 시도가 이전 · 이번 시도의 관계를 모두 지울 수 있게 합친다."""
+    """시작 기록의 kg_keys — 다음 시도가 이전 · 이번 시도의 관계와 앵커 청크를 지울 수 있게 합친다.
+
+    ``anchor_content`` 는 직전 완료본의 앵커로 두고(아직 LightRAG 에 있다), 이전 PENDING 이
+    기억하던 중간 앵커와 이번 시도의 새 앵커는 ``stale_anchors`` 에 쌓는다.
+    """
     if previous is None:
         return new
     relations = tuple(dict.fromkeys((*previous.relations, *new.relations)))
-    return KgKeys(new.chapter_entity, relations, previous.anchor_content)
+    stale = tuple(
+        a
+        for a in dict.fromkeys((*previous.stale_anchors, new.anchor_content))
+        if a != previous.anchor_content
+    )
+    return KgKeys(new.chapter_entity, relations, previous.anchor_content, stale)
 
 
 def _relation_owners(records: Collection[ChapterRecord]) -> RelationOwners:

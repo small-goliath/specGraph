@@ -53,6 +53,11 @@ def _chapter_dict(record: ChapterRecord) -> dict[str, Any]:
     }
 
 
+def _visible(records: list[ChapterRecord]) -> list[ChapterRecord]:
+    """삽입이 한 번도 완료되지 않은 PENDING 레코드는 LightRAG 에 없으므로 보이지 않는다(D6)."""
+    return [r for r in records if not r.is_hidden]
+
+
 class LookupService:
     def __init__(self, manifest: ManifestPort) -> None:
         self.manifest = manifest
@@ -73,12 +78,12 @@ class LookupService:
 
     async def find_screen(self, screen_id: str) -> dict[str, Any]:
         identifier = screen_id.strip().upper()
-        records = await self.manifest.chapters_with_screen(identifier)
+        records = _visible(await self.manifest.chapters_with_screen(identifier))
         return await self._find_definition(identifier, records, "screen")
 
     async def find_policy(self, policy_id: str) -> dict[str, Any]:
         identifier = policy_id.strip().upper()
-        records = await self.manifest.chapters_with_policy(identifier)
+        records = _visible(await self.manifest.chapters_with_policy(identifier))
         return await self._find_definition(identifier, records, "policy")
 
     async def _resolve_document(self, doc: str, records: list[ChapterRecord]) -> list[str]:
@@ -102,7 +107,7 @@ class LookupService:
         return matched
 
     async def get_chapter(self, doc: str, section: str) -> dict[str, Any]:
-        records = await self.manifest.all_chapters()
+        records = _visible(await self.manifest.all_chapters())
         if "#" in doc and ":" in doc:
             doc, _, embedded = doc.rpartition("#")
             section = section or embedded
@@ -122,7 +127,7 @@ class LookupService:
 
     async def list_docs(self) -> dict[str, Any]:
         """브랜치 commit_sha 는 manifest 의 브랜치 HEAD(없으면 — 부분 실패 — 첫 챕터의 SHA)."""
-        records = sorted(await self.manifest.all_chapters(), key=_chapter_order)
+        records = sorted(_visible(await self.manifest.all_chapters()), key=_chapter_order)
         heads = await self.manifest.branch_heads()
         branches: dict[str, dict[str, Any]] = {}
         for record in records:

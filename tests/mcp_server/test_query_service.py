@@ -201,3 +201,77 @@ async def test_result_to_dict_has_sources_with_commit_sha(manifest):
 
     assert data["answer"]
     assert data["sources"][0] == {"doc_id": PARTNER2, "commit_sha": "sha-ptn"}
+
+
+def _pending_record(doc_id, text, *, commit_sha, content_commit_sha):
+    """삽입 시작 기록(content_hash 가 빈 PENDING). content_commit_sha 가 비면 첫 삽입이다."""
+    from dataclasses import replace
+
+    base = _record(doc_id, text, commit_sha)
+    return replace(
+        base,
+        doc_id=doc_id,
+        content_hash="",
+        commit_sha=commit_sha,
+        content_commit_sha=content_commit_sha,
+    )
+
+
+async def test_query_excludes_pending_record_from_sources(manifest):
+    manifest.records[PARTNER2] = _pending_record(
+        PARTNER2, "## 2. PTN-P-04 정산 조회\n새 본문", commit_sha="sha-new", content_commit_sha=""
+    )
+    service, _, llm = _service(manifest, _partner_only_retrieval())
+
+    result = await service.query("파트너 정산 주기 근거는?", "mix", None)
+
+    assert PARTNER2 not in [s.doc_id for s in result.sources]
+    assert "sha-new" not in str(result.to_dict())
+
+
+async def test_query_source_sha_uses_completed_commit_during_reinsert(manifest):
+    """AC3: 재삽입 중 출처 SHA 는 새 삽입이 끝나기 전 완료본의 SHA 다."""
+    manifest.records[PARTNER2] = _pending_record(
+        PARTNER2, "## 2. 직전 완료본", commit_sha="sha-done", content_commit_sha="sha-done"
+    )
+    service, _, _ = _service(manifest, _partner_only_retrieval())
+
+    result = await service.query("파트너 정산 주기 근거는?", "mix", None)
+
+    assert Source(PARTNER2, "sha-done") in result.sources
+
+
+async def test_query_reference_expansion_ignores_pending_kg_keys(manifest):
+    """AC4: PENDING 레코드의 kg_keys(옛 · 새 시도의 관계를 합친 값)로 참조를 확장하지 않는다."""
+    from dataclasses import replace
+
+    from specgraph.kg_model import KgKeys
+
+    # PARTNER2 는 재삽입 중(보이는 PENDING) — kg_keys 에 ADMIN5 관계가 있어도 따라가지 않는다.
+    pending = _pending_record(
+        PARTNER2,
+        "## 2. PTN-P-04 정산 조회\n직전 본문",
+        commit_sha="sha-done",
+        content_commit_sha="sha-done",
+    )
+    manifest.records[PARTNER2] = replace(
+        pending, kg_keys=KgKeys(PARTNER2, ((PARTNER2, ADMIN5),), "anchor")
+    )
+    service, _, _ = _service(manifest, _partner_only_retrieval())
+
+    result = await service.query("파트너 정산 정책 근거는?", "mix", None)
+
+    assert [s.doc_id for s in result.sources] == [PARTNER2]
+
+
+async def test_query_reference_expansion_skips_hidden_target(manifest):
+    from dataclasses import replace
+
+    manifest.records[ADMIN5] = replace(
+        manifest.records[ADMIN5], content_hash="", content_commit_sha=""
+    )
+    service, _, _ = _service(manifest, _partner_only_retrieval())
+
+    result = await service.query("파트너 정산 정책 근거는?", "mix", None)
+
+    assert ADMIN5 not in [s.doc_id for s in result.sources]

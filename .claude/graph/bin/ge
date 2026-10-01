@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Graph Engineering 상태 런타임 래퍼.
+#   사용법: .claude/graph/bin/ge <subcommand> [...]
+# 노드(서브에이전트)는 상태 파일을 직접 편집하지 않고 반드시 이 래퍼만 쓴다.
+set -u
+
+GE_BIN_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+GE_ROOT=$(cd -- "$GE_BIN_DIR/../../.." && pwd)
+GE_IMPL="$GE_ROOT/.claude/graph/lib/ge_state.py"
+
+if [ ! -f "$GE_IMPL" ]; then
+  echo "[ge] 런타임이 없다: $GE_IMPL" >&2
+  exit 1
+fi
+
+GE_PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1; then GE_PY="$c"; break; fi
+done
+if [ -z "$GE_PY" ]; then
+  echo "[ge] python3 가 필요하다. 설치 후 다시 시도하라." >&2
+  exit 1
+fi
+
+CLAUDE_PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$GE_ROOT}" exec "$GE_PY" "$GE_IMPL" "$@"

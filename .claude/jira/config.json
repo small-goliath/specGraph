@@ -1,0 +1,23 @@
+{
+  "$comment": "JIRA Ticket 스킬 설정. 접속 정보(cloud_id·site_url)를 비워두면 .claude/graph/config.json 의 값을 그대로 쓴다 — 한 곳에서만 관리한다.",
+  "schema_version": 1,
+
+  "jira": {
+    "cloud_id": null,
+    "site_url": null
+  },
+
+  "ticket": {
+    "default_project": "PPS",
+    "default_issue_type": "작업",
+    "$comment_issue_type": "실제 이름은 프로젝트마다 다르다. 생성 직전 mcp__atlassian__getJiraProjectIssueTypesMetadata 로 확인하고, 다르면 여기를 고친다.",
+    "enforce_on_create": true,
+    "$comment_enforce": "true 면 등록·승인된 초안 없이는 mcp__atlassian__createJiraIssue 를 훅이 차단한다. 이 스킬을 건너뛰고 양식 밖의 티켓을 만드는 경로를 없앤다. false 로 두면 검증은 그대로 쓰되 차단은 하지 않는다.",
+    "summary_max_len": 255,
+    "ac_min_len": 6
+  },
+
+  "state": {
+    "dir": ".claude/jira/drafts"
+  }
+}

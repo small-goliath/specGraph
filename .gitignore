@@ -1,0 +1,9 @@
+# Graph Engineering 런타임 산출물 — 실행별·머신별이고 JIRA 티켓 원문이 들어간다.
+# .claude/graph/config.json 은 팀 공용 설정이므로 반대로 반드시 커밋한다.
+.claude/graph/state/
+.claude/graph/logs/
+.claude/graph/tmp/
+
+# JIRA Ticket 초안 — 논의 내용과 티켓 원문이 들어간다.
+# .claude/jira/config.json 은 팀 공용 설정이므로 반대로 반드시 커밋한다.
+.claude/jira/drafts/

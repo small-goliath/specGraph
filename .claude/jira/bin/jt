@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# JIRA Ticket 런타임 래퍼.
+#   사용법: .claude/jira/bin/jt <subcommand> [...]
+# 티켓 초안 상태는 이 래퍼로만 읽고 쓴다.
+set -u
+
+JT_BIN_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+JT_ROOT=$(cd -- "$JT_BIN_DIR/../../.." && pwd)
+JT_IMPL="$JT_ROOT/.claude/jira/lib/jt_ticket.py"
+
+if [ ! -f "$JT_IMPL" ]; then
+  echo "[jt] 런타임이 없다: $JT_IMPL" >&2
+  exit 1
+fi
+
+JT_PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1; then JT_PY="$c"; break; fi
+done
+if [ -z "$JT_PY" ]; then
+  echo "[jt] python3 가 필요하다. 설치 후 다시 시도하라." >&2
+  exit 1
+fi
+
+CLAUDE_PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$JT_ROOT}" exec "$JT_PY" "$JT_IMPL" "$@"

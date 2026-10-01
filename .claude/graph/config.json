@@ -1,0 +1,144 @@
+{
+  "$comment": "Graph Engineering 프로젝트 설정. 저장소 사실을 하드코딩하지 않는다 — 런타임 탐지 값은 state 에 들어간다.",
+  "schema_version": 1,
+
+  "git": {
+    "base_branch_candidates": ["main", "master", "develop"],
+    "branch_name_template": "{TICKET}",
+    "require_clean_worktree": true,
+    "allow_push": false,
+    "allow_pr": false
+  },
+
+  "jira": {
+    "cloud_id": "a730747b-02e7-490f-bf6e-2887496a24f6",
+    "site_url": "https://payprotocol.atlassian.net",
+    "$comment_transitions": "transition 은 이름이 아니라 목표 상태(to.name)로 매칭한다. PPS 워크플로 실측: '검토 중'→transition name '착수'(id 8), '개발 중'→'개발착수'(id 3). 이름 매칭은 반드시 실패하므로 절대 쓰지 말 것.",
+    "status_targets": {
+      "N1_on_receive": "검토 중",
+      "N4_on_develop": "개발 중",
+      "N5_on_verify": "검증 중"
+    },
+    "project_overrides": {
+      "PPS": {
+        "status_targets": {
+          "N1_on_receive": "검토 중",
+          "N4_on_develop": "개발 중",
+          "N5_on_verify": "검증 중"
+        },
+        "known_status_ids": {
+          "해야 할 일": "10059",
+          "검토 중": "10060",
+          "개발 중": "10065",
+          "검증 중": "10063",
+          "HOLDING": "10062",
+          "완료": "10061"
+        }
+      }
+    },
+    "transition_policy": {
+      "$comment": "노드 → status_targets 키. 여기 실린 노드는 **본 작업 이전에** 목표 상태로 전이하고 `ge jira-transition` 으로 기록해야 진입할 수 있다. 첫 진입만이 아니라 **매 진입마다** 다시 전이한다(N5→N4 루프에서 개발 중 ↔ 검증 중 가 오간다).",
+      "enforce": "block",
+      "$comment_enforce": "block | warn | off. block = 기록 없이 `ge node <노드> --status running` 이 exit 2 로 거부된다.",
+      "nodes": {
+        "N1": "N1_on_receive",
+        "N4": "N4_on_develop",
+        "N5": "N5_on_verify"
+      }
+    },
+    "match_strategy": ["to.name.exact", "to.name.normalized", "to.id", "ask_user"],
+    "on_match_failure": "ask_user"
+  },
+
+  "gates": {
+    "required": ["GATE-PLAN", "GATE-REVIEW", "GATE-COMMIT"],
+    "$comment_ticket": "GATE-TICKET 은 상시 필수가 아니라 AMEND 노드에 들어갔을 때만 발동한다. JIRA 티켓 본문 쓰기는 이 승인 없이는 훅이 차단한다.",
+    "conditional": { "GATE-TICKET": "AMEND 노드 진입 시" },
+    "approval_words": ["approve", "approved", "승인", "승인함", "ok approve", "/graph-approve"],
+    "rejection_words": ["reject", "반려", "거부", "/graph-reject"],
+    "bind_to_artifact_hash": true
+  },
+
+  "retries": {
+    "n5_to_n4": 3,
+    "n6_to_n4": 2,
+    "gate_to_amend": 2,
+    "$comment_amend": "게이트 반려가 '요구사항 불일치' 여서 티켓을 고치고 되돌아가는 횟수의 상한. 넘으면 정지·에스컬레이션한다 — 그 시점의 문제는 '요구사항이 아직 확정되지 않았다' 는 것이지 더 고쳐서 될 일이 아니다."
+  },
+
+  "tdd": {
+    "mode": "block",
+    "$comment_mode": "block | warn | off. block = 해당 N4 시도에서 테스트 파일 쓰기가 한 번도 없으면 프로덕션 소스 쓰기를 차단(Red-First).",
+    "default_test_framework_by_language": {
+      "kotlin": "kotest",
+      "java": "junit5"
+    },
+    "$comment_default_fw": "**greenfield 전용 제안값**이다. 기존 프로젝트에서는 실제로 탐지된 runtime.build.test_framework 과 저장소의 지배적 패턴이 무조건 우선한다. 이 값은 runtime.build.test_framework_suggested 로만 실리며, 확정은 GATE-PLAN 승인으로 한다. Kotest 는 Kotlin DSL 기반이라 Java 프로젝트에 강요하지 않는다.",
+    "exempt_globs": [
+      "**/build.gradle", "**/build.gradle.kts", "**/settings.gradle", "**/settings.gradle.kts",
+      "gradle/**", "gradlew", "gradlew.bat", "**/gradle.properties", "**/libs.versions.toml",
+      "**/*.md", "**/*.txt", "**/*.json", "**/*.yml", "**/*.yaml", "**/*.xml", "**/*.properties",
+      "**/*.sql", "**/*.http", ".claude/**", "docs/**", ".gitignore", ".editorconfig",
+      "**/src/main/resources/**", "**/src/test/resources/**",
+      "graphify-out/**"
+    ],
+    "test_path_patterns": [
+      "**/src/test/**", "**/src/integrationTest/**", "**/src/testFixtures/**",
+      "**/test/**", "**/tests/**", "**/*Test.*", "**/*Tests.*", "**/*Spec.*", "**/*_test.*", "**/*.test.*"
+    ]
+  },
+
+  "api_docs": {
+    "mode": "block",
+    "$comment_mode": "block | warn | off. Spring Boot 프로젝트면 항상 발동한다(spring-restdocs 의존성 유무와 무관 — 조건부 아님; 의존성이 없으면 도입 자체가 강제된다). block = 변경된 컨트롤러에 REST Docs 스니펫을 만드는 테스트가 없으면 `ge apidocs check` 가 exit 2 를 내고 커밋 훅이 차단한다.",
+    "style": "spring-restdocs",
+    "$comment_style": "Spring REST Docs 는 언어와 무관하다. 테스트를 무엇으로 쓰든(Kotest/JUnit5/Spock) 같은 스니펫이 나온다. 문서화는 TDD 사이클 밖의 별도 단계가 아니라 Red 단계에 함께 들어간다.",
+    "exempt_globs": [
+      "**/actuator/**",
+      "**/*HealthController.*",
+      "**/internal/**"
+    ],
+    "$comment_exempt": "외부 API 표면이 아닌 것들. 그 밖의 예외는 `ge apidocs exempt` 로 사유를 남긴다(리뷰에 노출된다)."
+  },
+
+  "arch_rules": {
+    "mode": "block",
+    "$comment_mode": "block | warn | off. 레이어를 갖춘 기존 JVM 프로젝트면 항상 발동한다(archunit 의존성 유무와 무관 — 조건부 아님; 의존성이 없는데 프로덕션 코드가 바뀌면 도입 자체가 강제된다). block = 미도입 상태에서 프로덕션 코드가 바뀌었는데 이번 시도에 규칙 테스트가 없으면 `ge archunit check` 가 exit 2 를 내고 커밋 훅이 차단한다.",
+    "style": "archunit",
+    "$comment_style": "ArchUnit 규칙은 평범한 테스트다 — 한번 도입되면 위반은 별도 검사가 아니라 N5 의 일반 테스트 실행이 잡는다. `ge archunit check` 는 '아직 도입 전인데 프로덕션 코드가 바뀌었는가' 라는 한 가지 사실만 본다.",
+    "$comment_exempt": "예외는 `ge archunit exempt` 로 사유를 남긴다(리뷰에 노출된다). REST Docs 와 달리 경로 단위가 아니라 티켓 단위 예외다."
+  },
+
+  "commit": {
+    "pattern": "^(feat|fix|refactor|test|docs|chore|perf|style|build|ci|revert)\\(([A-Z][A-Z0-9]+-[0-9]+)\\):\\s?\\S.*$",
+    "$comment_pattern": "type(scope:JIRA ticket):subject — scope 는 반드시 현재 실행 중인 티켓 키여야 한다.",
+    "allowed_types": ["feat", "fix", "refactor", "test", "docs", "chore", "perf", "style", "build", "revert"],
+    "subject_max_len": 100,
+    "graphify": {
+      "node": "N10",
+      "message": "feat(graphify): update",
+      "path_prefix": "graphify-out/",
+      "$comment": "N10 의 graphify 지식 그래프 자동 커밋 — 지금 노드가 여기 node 와 같고, 커밋 메시지가 message 와 정확히 같고, 스테이징된 파일이 전부 path_prefix 아래일 때만 GATE-REVIEW/GATE-COMMIT·컨벤션 검사 없이 통과한다(hooks/ge_hooks.py guard_commit). 셋 중 하나라도 어긋나면 일반 커밋 규칙으로 떨어진다."
+    }
+  },
+
+  "graphify": {
+    "marker": "graphify-out/graph.json",
+    "fallback_marker": "graphify-out",
+    "$comment": "존재하면 코드베이스를 읽는 모든 노드는 grep/read/glob 이전에 graphify skill 을 최우선으로 사용한다."
+  },
+
+  "build": {
+    "tool": "gradle",
+    "wrapper_first": true,
+    "default_test_task": "test",
+    "default_check_task": "check",
+    "on_detect_failure": "halt_and_ask"
+  },
+
+  "state": {
+    "dir": ".claude/graph/state",
+    "logs_dir": ".claude/graph/logs",
+    "pointer": ".claude/graph/state/current"
+  }
+}

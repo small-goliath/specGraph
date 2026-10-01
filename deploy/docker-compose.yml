@@ -1,0 +1,179 @@
+# specGraph PoC — 로컬 Docker Compose (PPS-346)
+#
+#   cp deploy/.env.example deploy/.env   # 토큰 · 비밀번호 입력
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d
+#
+# - 모델명 · 엔드포인트는 전부 .env 변수다(이 파일에 모델 리터럴을 두지 않는다).
+# - 포트는 127.0.0.1 에만 바인딩한다(로컬 단일 사용자 전제). 인증은 범위 밖이므로 넣지 않는다.
+# - LightRAG 서버는 WebUI · REST 질의용이다. 문서 쓰기 주체는 indexer 하나다
+#   (WebUI · REST 의 업로드 · 삭제 · 엔티티 편집 API 는 쓰지 않는다 — runbook §8).
+# - POSTGRES_PASSWORD 는 기본값이 없다. 비어 있으면 compose 가 기동을 거부한다.
+
+name: specgraph
+
+x-ollama-image: &ollama-image ${OLLAMA_IMAGE}
+
+x-model-env: &model-env
+  LLM_BINDING: ollama
+  LLM_MODEL: ${LLM_MODEL}
+  LLM_BINDING_HOST: ${LLM_BINDING_HOST}
+  OLLAMA_LLM_THINK: ${OLLAMA_LLM_THINK}
+  EMBEDDING_BINDING: ${EMBEDDING_BINDING}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+  EMBEDDING_DIM: ${EMBEDDING_DIM}
+  EMBEDDING_BINDING_HOST: ${EMBEDDING_BINDING_HOST}
+  RERANK_BINDING: ${RERANK_BINDING}
+  RERANK_MODEL: ${RERANK_MODEL}
+  RERANK_BINDING_HOST: ${RERANK_BINDING_HOST}
+  SUMMARY_LANGUAGE: ${SUMMARY_LANGUAGE}
+  CHUNK_SIZE: ${CHUNK_SIZE}
+  MAX_ASYNC: ${MAX_ASYNC}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 를 deploy/.env 에 설정하라}
+  POSTGRES_DATABASE: ${POSTGRES_DATABASE}
+  LIGHTRAG_KV_STORAGE: ${LIGHTRAG_KV_STORAGE}
+  LIGHTRAG_VECTOR_STORAGE: ${LIGHTRAG_VECTOR_STORAGE}
+  LIGHTRAG_GRAPH_STORAGE: ${LIGHTRAG_GRAPH_STORAGE}
+  LIGHTRAG_DOC_STATUS_STORAGE: ${LIGHTRAG_DOC_STATUS_STORAGE}
+
+services:
+  postgres:
+    build:
+      context: ./postgres
+    image: specgraph-postgres:pg16-age
+    command: ["postgres", "-c", "shared_preload_libraries=age"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 를 deploy/.env 에 설정하라}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-extensions.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  ollama:
+    image: *ollama-image
+    environment:
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE}
+    ports:
+      - "127.0.0.1:${OLLAMA_HOST_PORT}:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  # 1회성: LLM · 임베딩 모델을 이름 있는 볼륨에 받아 둔다(재기동 시 재다운로드 없음).
+  ollama-pull:
+    image: *ollama-image
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_PULL_MODELS: ${OLLAMA_PULL_MODELS}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["for m in $$OLLAMA_PULL_MODELS; do ollama pull \"$$m\" || exit 1; done"]
+    restart: "no"
+
+  # 리랭커(및 선택적 OpenAI 호환 임베딩) — Infinity, Cohere 호환 /rerank.
+  rerank:
+    image: ${INFINITY_IMAGE}
+    command: "v2 --port 7997 --model-id ${RERANK_MODEL} ${INFINITY_EXTRA_ARGS}"
+    environment:
+      HF_HOME: /models
+    ports:
+      - "127.0.0.1:${RERANK_HOST_PORT}:7997"
+    volumes:
+      - hf-cache:/models
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:7997/health', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 60
+    restart: unless-stopped
+
+  lightrag:
+    image: ${LIGHTRAG_IMAGE}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      <<: *model-env
+      HOST: 0.0.0.0
+      PORT: "9621"
+      WORKING_DIR: /app/data/rag_storage
+      INPUT_DIR: /app/data/inputs
+    ports:
+      - "127.0.0.1:${LIGHTRAG_HOST_PORT}:9621"
+    volumes:
+      - lightrag-data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:9621/health', timeout=5)"
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  indexer:
+    build:
+      context: ..
+      dockerfile: deploy/app.Dockerfile
+    image: specgraph-app:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+      lightrag:
+        condition: service_healthy
+    environment:
+      <<: *model-env
+      SPECGRAPH_REPO_URL: ${SPECGRAPH_REPO_URL}
+      SPECGRAPH_GIT_TOKEN: ${SPECGRAPH_GIT_TOKEN}
+      SPECGRAPH_BRANCH_GLOB: ${SPECGRAPH_BRANCH_GLOB}
+      SPECGRAPH_INCLUDE_DIRS: ${SPECGRAPH_INCLUDE_DIRS}
+      SPECGRAPH_POLL_INTERVAL_SECONDS: ${SPECGRAPH_POLL_INTERVAL_SECONDS}
+      SPECGRAPH_GIT_TIMEOUT_SECONDS: ${SPECGRAPH_GIT_TIMEOUT_SECONDS}
+      SPECGRAPH_MAX_BLOCK_CHARS: ${SPECGRAPH_MAX_BLOCK_CHARS}
+      SPECGRAPH_LOG_FORMAT: ${SPECGRAPH_LOG_FORMAT}
+      SPECGRAPH_CACHE_DIR: /data/product-docs
+      SPECGRAPH_WORKING_DIR: /data/lightrag
+    volumes:
+      - indexer-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ollama:
+  hf-cache:
+  lightrag-data:
+  indexer-data:

@@ -7,3 +7,13 @@
 # JIRA Ticket 초안 — 논의 내용과 티켓 원문이 들어간다.
 # .claude/jira/config.json 은 팀 공용 설정이므로 반대로 반드시 커밋한다.
 .claude/jira/drafts/
+
+# specGraph (Python) — PPS-346
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+deploy/.env
+.cache/

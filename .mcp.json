@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "specgraph": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--quiet", "--directory", "${SPECGRAPH_HOME:-.}", "specgraph-mcp"],
+      "env": {
+        "SPECGRAPH_REPO_URL": "${SPECGRAPH_REPO_URL:-https://github.com/df-planning-dev/product-docs.git}",
+        "SPECGRAPH_LOG_LEVEL": "WARNING",
+        "LLM_MODEL": "${LLM_MODEL}",
+        "LLM_BINDING_HOST": "${LLM_BINDING_HOST:-http://localhost:11434}",
+        "EMBEDDING_BINDING": "${EMBEDDING_BINDING:-ollama}",
+        "EMBEDDING_MODEL": "${EMBEDDING_MODEL}",
+        "EMBEDDING_DIM": "${EMBEDDING_DIM:-1024}",
+        "EMBEDDING_BINDING_HOST": "${EMBEDDING_BINDING_HOST:-http://localhost:11434}",
+        "RERANK_BINDING": "cohere",
+        "RERANK_MODEL": "${RERANK_MODEL}",
+        "RERANK_BINDING_HOST": "${RERANK_BINDING_HOST:-http://localhost:7997/rerank}",
+        "SUMMARY_LANGUAGE": "${SUMMARY_LANGUAGE:-Korean}",
+        "POSTGRES_HOST": "${POSTGRES_HOST:-localhost}",
+        "POSTGRES_PORT": "${POSTGRES_PORT:-5432}",
+        "POSTGRES_USER": "${POSTGRES_USER:-specgraph}",
+        "POSTGRES_PASSWORD": "${POSTGRES_PASSWORD}",
+        "POSTGRES_DATABASE": "${POSTGRES_DATABASE:-specgraph}",
+        "LIGHTRAG_KV_STORAGE": "PGKVStorage",
+        "LIGHTRAG_VECTOR_STORAGE": "PGVectorStorage",
+        "LIGHTRAG_GRAPH_STORAGE": "PGGraphStorage",
+        "LIGHTRAG_DOC_STATUS_STORAGE": "PGDocStatusStorage"
+      }
+    }
+  }
+}

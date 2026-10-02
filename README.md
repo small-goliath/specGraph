@@ -170,7 +170,7 @@ docs/            PPS-346-runbook.md (실행 · 수동 검증 · 알려진 제약
 | `SPECGRAPH_REPO_URL` | `https://github.com/df-planning-dev/product-docs.git` | 인덱싱할 저장소 |
 | `SPECGRAPH_GIT_TOKEN` | — | 읽기 전용 토큰 |
 | `SPECGRAPH_BRANCH_GLOB` | `draft/*` | 대상 브랜치 |
-| `SPECGRAPH_INCLUDE_DIRS` | `prd,ui-ux-spec,tech-spec,qa` | 대상 디렉터리 |
+| `SPECGRAPH_INCLUDE_DIRS` | `prd,ui-ux-spec,tech-spec,qa` | 대상 디렉터리 이름만 나열한다. 인덱싱 대상은 `<프로젝트>/<대상 디렉터리>/…` 아래의 `.md` 이며 프로젝트 이름(예: `settlr`)은 나열하지 않는다 |
 | `SPECGRAPH_POLL_INTERVAL_SECONDS` | `120` | 폴링 주기 |
 | `SPECGRAPH_LOG_FORMAT` | `kv` | `json` 이면 JSON 로그(stderr) |
 | `LLM_MODEL` | `qwen3:8b` | LLM |

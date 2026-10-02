@@ -8,10 +8,11 @@ from specgraph.indexer.git_source import GitSource
 from specgraph.indexer.service import IndexerService
 from specgraph.llm import LlmCallCounter
 
+PROJECT = "settlr"
 ADMIN_BRANCH = "draft/settlr-admin-prd"
 PARTNER_BRANCH = "draft/settlr-partner-prd"
-ADMIN_PATH = "prd/settlr-admin-prd.md"
-PARTNER_PATH = "prd/settlr-partner-prd.md"
+ADMIN_PATH = f"{PROJECT}/prd/settlr-admin-prd.md"
+PARTNER_PATH = f"{PROJECT}/prd/settlr-partner-prd.md"
 
 
 @pytest.fixture
@@ -27,9 +28,13 @@ def env(git_remote, tmp_path, docs):
     remote = git_remote()
     remote.commit(
         ADMIN_BRANCH,
-        {ADMIN_PATH: docs["admin"], "README.md": "# readme", "prd/a.docx": "bin"},
+        {
+            ADMIN_PATH: docs["admin"],
+            f"{PROJECT}/README.md": "# readme",
+            f"{PROJECT}/prd/a.docx": "bin",
+        },
     )
-    remote.commit(PARTNER_BRANCH, {PARTNER_PATH: docs["partner"], "CLAUDE.md": "x"})
+    remote.commit(PARTNER_BRANCH, {PARTNER_PATH: docs["partner"], f"{PROJECT}/CLAUDE.md": "x"})
     remote.commit("main", {"README.md": "main"})
     counter = LlmCallCounter()
     rag = FakeLightRAG(counter=counter)
@@ -167,11 +172,15 @@ async def test_new_branch_indexed_next_poll(env):
     remote, service, rag, _, _ = env
     await service.poll_once()
 
-    remote.commit("draft/settlr-new-prd", {"prd/settlr-new-prd.md": "## 1. 새 문서\n본문"})
+    remote.commit(
+        "draft/settlr-new-prd", {f"{PROJECT}/prd/settlr-new-prd.md": "## 1. 새 문서\n본문"}
+    )
     result = await service.poll_once()
 
     assert result.indexed == ["draft/settlr-new-prd"]
-    assert rag.doc_ids("draft/settlr-new-prd:") == ["draft/settlr-new-prd:prd/settlr-new-prd.md#1"]
+    assert rag.doc_ids("draft/settlr-new-prd:") == [
+        f"draft/settlr-new-prd:{PROJECT}/prd/settlr-new-prd.md#1"
+    ]
 
 
 async def test_deleted_branch_removed_next_poll(env):
@@ -207,10 +216,12 @@ async def test_removed_file_deletes_its_chapters(env):
     remote, service, rag, _, _ = env
     await service.poll_once()
 
-    remote.commit(PARTNER_BRANCH, {PARTNER_PATH: None, "prd/other.md": "## 1. 다른\n본문"})
+    remote.commit(
+        PARTNER_BRANCH, {PARTNER_PATH: None, f"{PROJECT}/prd/other.md": "## 1. 다른\n본문"}
+    )
     await service.poll_once()
 
-    assert rag.doc_ids(f"{PARTNER_BRANCH}:") == [f"{PARTNER_BRANCH}:prd/other.md#1"]
+    assert rag.doc_ids(f"{PARTNER_BRANCH}:") == [f"{PARTNER_BRANCH}:{PROJECT}/prd/other.md#1"]
 
 
 async def test_glossary_aliases_merged_after_insert(env):
@@ -267,8 +278,8 @@ def _service(remote, tmp_path, rag, manifest, counter):
 async def test_identical_chapter_bodies_in_two_documents_are_both_indexed(git_remote, tmp_path):
     remote = git_remote()
     template = "## 9. 변경 이력\n\n| 버전 | 일자 |\n|---|---|\n| 0.1 | 2026-09-01 |\n"
-    remote.commit("draft/settlr-a-prd", {"prd/settlr-a-prd.md": template})
-    remote.commit("draft/settlr-b-prd", {"prd/settlr-b-prd.md": template})
+    remote.commit("draft/settlr-a-prd", {f"{PROJECT}/prd/settlr-a-prd.md": template})
+    remote.commit("draft/settlr-b-prd", {f"{PROJECT}/prd/settlr-b-prd.md": template})
     counter = LlmCallCounter()
     rag = FakeLightRAG(counter=counter)
     service = _service(remote, tmp_path, rag, InMemoryManifest(), counter)
@@ -277,8 +288,8 @@ async def test_identical_chapter_bodies_in_two_documents_are_both_indexed(git_re
 
     assert result.failed == {}
     assert rag.doc_ids() == [
-        "draft/settlr-a-prd:prd/settlr-a-prd.md#9",
-        "draft/settlr-b-prd:prd/settlr-b-prd.md#9",
+        f"draft/settlr-a-prd:{PROJECT}/prd/settlr-a-prd.md#9",
+        f"draft/settlr-b-prd:{PROJECT}/prd/settlr-b-prd.md#9",
     ]
 
 
@@ -399,7 +410,10 @@ async def test_non_utf8_markdown_is_skipped_with_warning_and_branch_indexed(
     remote = git_remote()
     remote.commit(
         "draft/settlr-a-prd",
-        {"prd/good.md": "## 1. 정상\n본문", "prd/bad.md": "## 1. 깨짐\n정산".encode("cp949")},
+        {
+            f"{PROJECT}/prd/good.md": "## 1. 정상\n본문",
+            f"{PROJECT}/prd/bad.md": "## 1. 깨짐\n정산".encode("cp949"),
+        },
     )
     counter = LlmCallCounter()
     rag = FakeLightRAG(counter=counter)
@@ -410,9 +424,9 @@ async def test_non_utf8_markdown_is_skipped_with_warning_and_branch_indexed(
     result = await service.poll_once()
 
     assert result.failed == {} and result.indexed == ["draft/settlr-a-prd"]
-    assert rag.doc_ids() == ["draft/settlr-a-prd:prd/good.md#1"]
+    assert rag.doc_ids() == [f"draft/settlr-a-prd:{PROJECT}/prd/good.md#1"]
     skipped = _events(caplog, "file_skipped")
-    assert len(skipped) == 1 and "path=prd/bad.md" in skipped[0]
+    assert len(skipped) == 1 and f"path={PROJECT}/prd/bad.md" in skipped[0]
 
 
 PARTNER2 = f"{PARTNER_BRANCH}:{PARTNER_PATH}#2"
@@ -491,8 +505,8 @@ async def test_failed_lightrag_doc_of_never_completed_branch_removed_after_remot
 ):
     """R2-C5: 한 번도 끝까지 동기화되지 못한 브랜치의 LightRAG 문서(FAILED)도 삭제 때 정리된다."""
     remote = git_remote()
-    doc = "draft/settlr-x-prd:prd/settlr-x-prd.md#1"
-    remote.commit("draft/settlr-x-prd", {"prd/settlr-x-prd.md": "## 1. 하나\n본문"})
+    doc = f"draft/settlr-x-prd:{PROJECT}/prd/settlr-x-prd.md#1"
+    remote.commit("draft/settlr-x-prd", {f"{PROJECT}/prd/settlr-x-prd.md": "## 1. 하나\n본문"})
     counter = LlmCallCounter()
     rag = FakeLightRAG(counter=counter, fail_on={doc})
     service = _service(remote, tmp_path, rag, InMemoryManifest(), counter)
@@ -510,7 +524,9 @@ def _three_branch_env(git_remote, tmp_path, docs):
     remote = git_remote()
     remote.commit(PARTNER_BRANCH, {PARTNER_PATH: docs["partner"]})
     billing = "draft/settlr-billing-prd"
-    remote.commit(billing, {"prd/settlr-billing-prd.md": "## 1. 개요\n수수료는 Admin PRD §5 참고"})
+    remote.commit(
+        billing, {f"{PROJECT}/prd/settlr-billing-prd.md": "## 1. 개요\n수수료는 Admin PRD §5 참고"}
+    )
     counter = LlmCallCounter()
     rag = FakeLightRAG(counter=counter)
     manifest = InMemoryManifest()
@@ -522,7 +538,7 @@ async def test_reconcile_failure_isolated_per_record_logged_and_retried_next_pol
 ):
     """R2-C6 · R2-T5: 참조 재해석 실패는 레코드 단위로 격리 · traceback 기록 · 다음 주기 재시도."""
     remote, service, rag, manifest, billing = _three_branch_env(git_remote, tmp_path, docs)
-    billing1 = f"{billing}:prd/settlr-billing-prd.md#1"
+    billing1 = f"{billing}:{PROJECT}/prd/settlr-billing-prd.md#1"
     await service.poll_once()  # admin 문서가 아직 없다 → 두 참조 모두 미해석
     remote.commit(ADMIN_BRANCH, {ADMIN_PATH: docs["admin"]})
     rag.fail_kg_once.add(PARTNER2)
@@ -582,7 +598,7 @@ async def test_glossary_failure_logged_and_retried_next_poll(env, caplog):
 async def test_mutual_reference_edge_survives_reinsert_of_one_side(git_remote, tmp_path):
     """C9: 무방향 엣지 — 한쪽 챕터를 다시 넣어도 상대 챕터가 소유한 엣지는 남는다."""
     remote = git_remote()
-    path = "prd/settlr-m-prd.md"
+    path = f"{PROJECT}/prd/settlr-m-prd.md"
     branch = "draft/settlr-m-prd"
     ch1, ch2 = f"{branch}:{path}#1", f"{branch}:{path}#2"
     remote.commit(branch, {path: "## 1. 하나\n§2 참고\n\n## 2. 둘\n§1 참고\n"})
@@ -603,7 +619,7 @@ async def test_reference_to_missing_section_gets_edge_only_after_section_appears
 ):
     """C14: 없는 § 로는 엣지(placeholder)를 만들지 않고, 그 챕터가 생기면 재해석으로 잇는다."""
     remote = git_remote()
-    path = "prd/settlr-m-prd.md"
+    path = f"{PROJECT}/prd/settlr-m-prd.md"
     branch = "draft/settlr-m-prd"
     ch1, ch9 = f"{branch}:{path}#1", f"{branch}:{path}#9"
     remote.commit(branch, {path: "## 1. 하나\n§9 참고\n"})
@@ -780,7 +796,7 @@ async def test_insert_failure_then_content_change_retry_deletes_intermediate_anc
 async def test_mutual_reference_edge_survives_reinsert_of_second_chapter(git_remote, tmp_path):
     """R3-T2 (AC12): 챕터 2 쪽(역방향 소유자)을 다시 넣어도 챕터 1 소유 엣지는 남는다."""
     remote = git_remote()
-    path = "prd/settlr-m-prd.md"
+    path = f"{PROJECT}/prd/settlr-m-prd.md"
     branch = "draft/settlr-m-prd"
     ch1, ch2 = f"{branch}:{path}#1", f"{branch}:{path}#2"
     remote.commit(branch, {path: "## 1. 하나\n§2 참고\n\n## 2. 둘\n§1 참고\n"})
@@ -794,3 +810,41 @@ async def test_mutual_reference_edge_survives_reinsert_of_second_chapter(git_rem
     await service.poll_once()
 
     assert rag.has_edge(ch1, ch2)
+
+
+async def test_sync_logs_chapter_insert_for_project_scoped_doc(git_remote, tmp_path, caplog):
+    """PPS-348 AC10: `<프로젝트>/<대상 디렉터리>/…` 문서의 챕터가 insert 로그와 함께 색인된다."""
+    remote = git_remote()
+    path = "settlr/prd/admin-prd.md"
+    branch = "draft/settlr-admin-prd"
+    remote.commit(branch, {path: "## 1. 개요\n본문"})
+    counter = LlmCallCounter()
+    rag = FakeLightRAG(counter=counter)
+    service = _service(remote, tmp_path, rag, InMemoryManifest(), counter)
+    caplog.set_level(logging.INFO)
+
+    await service.poll_once()
+
+    inserts = [ln for ln in _events(caplog, "chapter_sync") if "action=insert" in ln]
+    assert len(inserts) == 1 and f"doc_id={branch}:{path}#1 " in inserts[0]
+    assert rag.doc_ids(f"{branch}:") == [f"{branch}:{path}#1"]
+
+
+async def test_branch_without_target_files_ends_with_zero_inserted_and_no_error(
+    git_remote, tmp_path, caplog
+):
+    """PPS-348 AC12: 대상 문서가 없는 브랜치는 오류 없이 inserted=0 으로 끝난다."""
+    remote = git_remote()
+    branch = "draft/settlr-readme"
+    remote.commit(branch, {"settlr/README.md": "# readme"})
+    counter = LlmCallCounter()
+    rag = FakeLightRAG(counter=counter)
+    service = _service(remote, tmp_path, rag, InMemoryManifest(), counter)
+    caplog.set_level(logging.INFO)
+
+    result = await service.poll_once()
+
+    assert result.failed == {}
+    done = _events(caplog, "sync_done")
+    assert len(done) == 1 and f"branch={branch} " in done[0] and "inserted=0" in done[0]
+    assert rag.doc_ids() == []

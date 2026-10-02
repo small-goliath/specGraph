@@ -16,8 +16,8 @@ from specgraph.lightrag_store import decode_sources
 
 pytestmark = pytest.mark.integration
 
-ADMIN = ("draft/settlr-admin-prd", "prd/settlr-admin-prd.md", "settlr-admin-prd.md")
-PARTNER = ("draft/settlr-partner-prd", "prd/settlr-partner-prd.md", "settlr-partner-prd.md")
+ADMIN = ("draft/settlr-admin-prd", "settlr/prd/settlr-admin-prd.md", "settlr-admin-prd.md")
+PARTNER = ("draft/settlr-partner-prd", "settlr/prd/settlr-partner-prd.md", "settlr-partner-prd.md")
 
 
 @pytest.fixture

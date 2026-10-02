@@ -117,6 +117,29 @@ async def test_list_docs_groups_by_branch_with_sha(lookup):
     assert all(c["doc_id"] and c["commit_sha"] == "sha-a" for c in doc["chapters"])
 
 
+async def test_list_docs_shows_project_scoped_path():
+    """PPS-348 AC11: `<프로젝트>/<대상 디렉터리>/…` 경로 문서도 list_docs 에 그대로 나온다."""
+    path = "settlr/prd/admin-prd.md"
+    record = ChapterRecord(
+        doc_id=f"{ADMIN_BRANCH}:{path}#1",
+        branch=ADMIN_BRANCH,
+        path=path,
+        section="1",
+        title="1. 개요",
+        content="## 1. 개요",
+        content_hash="h",
+        commit_sha="sha-a",
+        content_commit_sha="sha-a",
+    )
+    manifest = InMemoryManifest(records={record.doc_id: record}, heads={ADMIN_BRANCH: "sha-a"})
+
+    result = await LookupService(manifest).list_docs()
+
+    doc = result["branches"][0]["documents"][0]
+    assert doc["path"] == path
+    assert [c["doc_id"] for c in doc["chapters"]] == [f"{ADMIN_BRANCH}:{path}#1"]
+
+
 async def test_list_docs_branch_commit_sha_comes_from_branch_head():
     """C13: 브랜치 commit_sha 는 첫 챕터가 아니라 manifest 의 브랜치 HEAD 다."""
     old = ChapterRecord(

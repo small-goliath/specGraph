@@ -1,6 +1,7 @@
 """인덱싱 대상 경로 필터 (AC11).
 
-포함: include_dirs(기본 prd · ui-ux-spec · tech-spec · qa) 아래의 ``.md``.
+포함: ``<프로젝트>/<대상 디렉터리>/…`` 아래의 ``.md``. 대상 디렉터리 이름은 include_dirs
+(기본 prd · ui-ux-spec · tech-spec · qa)이며, 프로젝트 이름은 설정에 나열하지 않는다.
 제외: README.md · CLAUDE.md(어느 위치든), ``.md`` 가 아닌 모든 파일(.docx · .png 등).
 """
 
@@ -18,7 +19,7 @@ def is_indexable(path: str, include_dirs: Sequence[str]) -> bool:
         return False
     if p.name.lower() in EXCLUDED_NAMES:
         return False
-    return len(p.parts) >= 2 and p.parts[0] in include_dirs
+    return len(p.parts) >= 3 and p.parts[1] in include_dirs
 
 
 def filter_paths(paths: Iterable[str], include_dirs: Sequence[str]) -> list[str]:

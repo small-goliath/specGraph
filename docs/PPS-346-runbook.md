@@ -138,6 +138,47 @@ claude                                 # 저장소 루트에서 실행 → .mcp.
 통합 테스트(선택, Q14): 스택이 떠 있을 때 §3 의 export 후 `uv run pytest -m integration`.
 각 테스트는 별도 manifest 스키마(`itest_*`)와 LightRAG workspace 를 써서 실제 인덱스를 건드리지 않는다.
 
+## 6-1. 인덱싱 대상 경로 규칙
+
+인덱서는 `draft/*` 브랜치에서 **`<프로젝트>/<대상 디렉터리>/…` 아래의 `.md`** 만 색인한다. 대상
+디렉터리 이름은 `SPECGRAPH_INCLUDE_DIRS`(기본 `prd,ui-ux-spec,tech-spec,qa`)이고, 프로젝트 이름(예:
+`settlr`)은 설정에 나열하지 않는다(경로의 첫 디렉터리는 무엇이든 프로젝트로 본다).
+README.md · CLAUDE.md 와 `.md` 가 아닌 파일은 제외한다.
+
+| 경로 | 색인 |
+|---|---|
+| `settlr/prd/admin-prd.md` | 포함 — doc_id `draft/settlr-admin-prd:settlr/prd/admin-prd.md#<§>` |
+| `paycoin-app/prd/daily-mission-prd.md` | 포함 |
+| `settlr/prd/nested/doc.md` | 포함(더 깊은 경로) |
+| `prd/a.md` (프로젝트 없음) | 제외 |
+| `a/b/prd/c.md` (대상 디렉터리가 세 번째 이후) | 제외 |
+| `settlr/docs/x.md` · `settlr/README.md` · `settlr/prd/doc.docx` | 제외 |
+
+대상 문서가 하나도 없는 브랜치(예: README 만 있는 `draft/settlr-readme`)는 오류 없이
+`event=sync_done ... inserted=0` 으로 끝난다.
+
+### 규칙 변경 후 재색인 절차 (배포 절차 — 코드 변경 아님)
+
+필터 규칙이 바뀌면, 이전 규칙으로 `inserted=0` 으로 끝난 브랜치는 `branch_heads` 에 HEAD 가
+기록돼 있어 다음 폴링에서 "변경 없음" 으로 건너뛰어진다.
+
+1. 읽기 전용 확인(SELECT 만). 스키마명은 기본 `specgraph`:
+   ```bash
+   docker compose -f deploy/docker-compose.yml --env-file deploy/.env exec postgres \
+     psql -U $POSTGRES_USER -d $POSTGRES_DATABASE \
+     -c "SELECT branch, head_sha FROM specgraph.branch_heads" \
+     -c "SELECT branch, count(*) FROM specgraph.chapters GROUP BY 1"
+   ```
+   대상 브랜치가 `branch_heads` 에 없으면 2 는 필요 없다(다음 폴링에서 새 브랜치로 잡힌다).
+2. **사용자 승인 후에만** 대상 브랜치의 HEAD 행을 삭제한다(데이터 삭제이며 스키마 변경이 아니다):
+   ```sql
+   DELETE FROM specgraph.branch_heads WHERE branch IN ('draft/settlr-admin-prd', ...);
+   ```
+   볼륨 재생성(`down -v`)은 LightRAG 데이터까지 지우므로 권장하지 않는다.
+3. 인덱서를 다시 동기화한다(`uv run specgraph-indexer --once` 또는 compose 인덱서의 다음 폴링).
+   브랜치가 새로 잡혀 새 규칙으로 인덱싱되고, 옛 경로(예: 최상위 `prd/…`)로 색인된 챕터가 있으면
+   삭제 처리된다. `event=chapter_sync action=insert` 로그로 확인한다.
+
 ## 7. 모델 라이선스 (M8)
 
 2026-10-01 Hugging Face 모델 메타데이터(`/api/models/<id>` 의 `cardData.license`)로 확인했다.
@@ -176,8 +217,11 @@ N8 에서 모델 카드 원문으로 재확인한다.
   실패시키지 않는다). 이미 인덱싱된 그 파일의 챕터는 "파일이 사라진 것"과 같게 지워진다.
 - **챕터 삽입 시작 기록:** 인덱서는 LightRAG 를 건드리기 전에 manifest 에 `content_hash` 가 빈
   시작 기록을 남긴다. 삽입이 중간에 실패하면 다음 주기에 그 챕터를 다시 넣고(이전 시도의 LightRAG
-  문서 · custom KG 관계를 지운 뒤), 브랜치가 지워지면 함께 정리된다. 시작 기록만 있는 챕터는
-  `get_chapter` · `find_screen` 에 새 내용으로 보이지만 질의(`query`) 근거에는 아직 없을 수 있다.
+  문서 · custom KG 관계를 지운 뒤), 브랜치가 지워지면 함께 정리된다. MCP 노출 규칙(PPS-347):
+  **처음 삽입하는 챕터의 시작 기록은 MCP 에 숨긴다**(`list_docs` · `get_chapter` · `find_screen` ·
+  `find_policy` 에 나오지 않고 `query` 의 `sources` 에도 없다). **재삽입 중인 챕터는 직전 완료본**
+  (본문 · SHA · 화면/정책)이 계속 보인다. 다만 `query` 의 LightRAG 프롬프트 본문(`answer`)에는
+  숨긴 챕터의 근거가 섞일 수 있다(`sources` 목록에는 없다).
 - **공유 노드(SCREEN · POLICY · DOCUMENT):** custom KG 를 넣을 때 이미 있는 노드의 설명 · 출처
   (LLM 이 추출한 것 포함)를 지우지 않고 합친다. 챕터를 지우거나 바꾸면 그 챕터의 출처만 뺀다.
   없는 § 를 가리키는 참조는 엣지를 만들지 않고(`dangling_refs`), 그 챕터가 생기면 재해석으로 잇는다.

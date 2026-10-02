@@ -10,8 +10,8 @@ from specgraph.mcp_server.query_service import QueryService
 
 pytestmark = pytest.mark.integration
 
-ADMIN = ("draft/settlr-admin-prd", "prd/settlr-admin-prd.md", "settlr-admin-prd.md")
-PARTNER = ("draft/settlr-partner-prd", "prd/settlr-partner-prd.md", "settlr-partner-prd.md")
+ADMIN = ("draft/settlr-admin-prd", "settlr/prd/settlr-admin-prd.md", "settlr-admin-prd.md")
+PARTNER = ("draft/settlr-partner-prd", "settlr/prd/settlr-partner-prd.md", "settlr-partner-prd.md")
 
 
 async def test_cross_branch_and_branch_scoped_query(

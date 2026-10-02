@@ -239,9 +239,11 @@ class IndexerService:
         try:
             for doc_id in plan.delete:
                 record = indexed[doc_id]
-                actions.append((doc_id, "delete", record.content_hash))
+                # 취소 · 실패로 끝나면 로그에 delete_failed 로 남도록 먼저 그렇게 적는다.
+                actions.append((doc_id, "delete_failed", record.content_hash))
                 with self.counter.attribute_to(doc_id):
                     await self._delete_chapter(record, context.owners)
+                actions[-1] = (doc_id, "delete", record.content_hash)
                 _add_owned(orphan_candidates, record)
 
             for doc_id in sorted([*plan.insert, *plan.reinsert]):
@@ -354,17 +356,19 @@ class IndexerService:
         owners = _relation_owners(await self.manifest.all_chapters())
         before = {d: self.counter.count_for(d) for d in records}
         orphan_candidates: dict[str, str] = {}
-        done: list[str] = []
+        done: list[tuple[str, str]] = []
         try:
             for doc_id in sorted(records):
-                done.append(doc_id)
+                # 취소 · 실패로 끝나면 delete_failed 로 남도록 먼저 그렇게 적는다.
+                done.append((doc_id, "delete_failed"))
                 with self.counter.attribute_to(doc_id):
                     await self._delete_chapter(records[doc_id], owners)
+                done[-1] = (doc_id, "delete")
                 _add_owned(orphan_candidates, records[doc_id])
             await self._delete_orphans(orphan_candidates)
         finally:
-            for doc_id in done:
-                self._log_chapter(doc_id, "delete", records[doc_id].content_hash, before)
+            for doc_id, action in done:
+                self._log_chapter(doc_id, action, records[doc_id].content_hash, before)
         await self.manifest.delete_branch_head(branch)
         log_event(
             logger,

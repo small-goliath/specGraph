@@ -103,3 +103,21 @@ async def test_counter_reset(settings):
     counter.reset()
 
     assert counter.total == 0 and counter.count_for("d#1") == 0
+
+
+async def test_chat_request_includes_configured_num_ctx(settings):
+    client = FakeOllamaClient()
+    llm, _ = _llm(settings, client)
+
+    await llm("p")
+
+    assert client.calls[0]["options"]["num_ctx"] == settings.llm_num_ctx
+
+
+async def test_caller_options_num_ctx_overrides_setting(settings):
+    client = FakeOllamaClient()
+    llm, _ = _llm(settings, client)
+
+    await llm("p", options={"num_ctx": 2048})
+
+    assert client.calls[0]["options"]["num_ctx"] == 2048

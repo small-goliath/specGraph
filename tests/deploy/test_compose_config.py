@@ -148,6 +148,33 @@ def test_postgres_image_pins_pg16_and_age():
     assert re.search(r"AGE_REF=PG16/v\d+\.\d+\.\d+", dockerfile)
 
 
+def test_llm_timeout_is_passed_to_lightrag_and_indexer(env_example, compose):
+    """PPS-349 AC1: .env 의 LLM_TIMEOUT 이 컨테이너 env 로 전달돼야 워커 한도가 따라간다."""
+    assert int(env_example["LLM_TIMEOUT"]) > 0
+    for name in ("lightrag", "indexer"):
+        assert _env(compose["services"][name])["LLM_TIMEOUT"] == "${LLM_TIMEOUT}", name
+
+
+def test_num_ctx_is_passed_to_lightrag_and_indexer(env_example, compose):
+    """PPS-349 AC3: 기본값 없는 참조라 .env.example 에 키가 없으면 빈 값이 컨테이너로 간다."""
+    assert int(env_example["OLLAMA_LLM_NUM_CTX"]) > 0
+    for name in ("lightrag", "indexer"):
+        assert _env(compose["services"][name])["OLLAMA_LLM_NUM_CTX"] == "${OLLAMA_LLM_NUM_CTX}"
+
+
+def test_indexer_has_stop_grace_period(compose):
+    """AC6 의 정적 전제 — 유예 기간이 초 단위로 명시돼 있고 docker 기본값(10s)보다 길다.
+
+    실제 SIGTERM 으로 137(SIGKILL) 없이 끝나는지는 이 테스트가 닫지 않는다(runbook §8 수동 검증).
+    """
+    grace = str(compose["services"]["indexer"]["stop_grace_period"])
+
+    assert re.fullmatch(r"\d+s", grace)
+    # 하한은 docker 기본 유예(10s)를 넘는다는 것뿐이다. 구체 값(현재 30s)은 runbook 이 '추정,
+    # 실측으로 조정'이라 한 값이므로 여기서 고정하지 않는다.
+    assert int(grace[:-1]) > 10
+
+
 def test_app_dockerfile_runs_indexer_without_dev_deps():
     dockerfile = (DEPLOY / "app.Dockerfile").read_text(encoding="utf-8")
 

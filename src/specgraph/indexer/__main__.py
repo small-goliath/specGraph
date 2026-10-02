@@ -38,6 +38,38 @@ async def _wait(stop: asyncio.Event, seconds: float) -> None:
         pass
 
 
+async def _poll_or_stop(service: _Pollable, stop: asyncio.Event) -> PollResult | None:
+    """``poll_once`` 를 종료 신호와 경쟁시킨다. 신호가 먼저 오면 poll 을 취소하고 ``None``.
+
+    poll 이 던진 예외는 그대로 전파한다. 이 함수 자체가 취소돼도 poll 태스크를 남기지 않는다.
+    """
+    if stop.is_set():
+        return None
+    poll = asyncio.create_task(service.poll_once())
+    waiter = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait({poll, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if poll.done():
+            return poll.result()
+        return None
+    finally:
+        waiter.cancel()
+        if not poll.done():
+            poll.cancel()
+            outcomes = await asyncio.gather(poll, return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException) and not isinstance(
+                    outcome, asyncio.CancelledError
+                ):
+                    log_event(
+                        logger,
+                        "poll_cancel_cleanup_failed",
+                        logging.ERROR,
+                        error_type=type(outcome).__name__,
+                        error=str(outcome),
+                    )
+
+
 async def run_loop(
     service: _Pollable,
     interval: float,
@@ -50,7 +82,11 @@ async def run_loop(
     sleeper = sleep or (lambda seconds: _wait(stop, seconds))
     while True:
         try:
-            result = await service.poll_once()
+            polled = await _poll_or_stop(service, stop)
+            if polled is None:
+                log_event(logger, "poll_cancelled", logging.WARNING, once=once)
+                return 1 if once else 0
+            result = polled
         except Exception as exc:  # noqa: BLE001 — 데몬은 다음 주기에 재시도한다
             log_event(
                 logger,

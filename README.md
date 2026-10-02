@@ -176,15 +176,26 @@ docs/            PPS-346-runbook.md (실행 · 수동 검증 · 알려진 제약
 | `LLM_MODEL` | `qwen3:8b` | LLM |
 | `EMBEDDING_MODEL` | `bge-m3` | 임베딩(차원 1024) |
 | `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | 리랭커 |
+| `LLM_TIMEOUT` | `.env.example` 1800(코드 기본 600) | LLM 호출 하나의 타임아웃(초). HTTP 읽기 한도는 이 값, LightRAG 워커 한도는 2배 |
+| `OLLAMA_LLM_NUM_CTX` | `16384` | Ollama 요청의 `num_ctx`(토큰). 서버 기본 4096 은 추출 출력이 길면 지시문이 잘린다 |
 | `POSTGRES_PASSWORD` | — | 필수, 기본값 없음 |
 
 임베딩 모델을 바꾸면 벡터 재색인이 필요하다(`down -v` 후 재기동).
+
+**기존 `deploy/.env` 를 쓰고 있다면 `LLM_TIMEOUT=1800` 과 `OLLAMA_LLM_NUM_CTX=16384` 두 줄을 추가해야
+한다(PPS-349).** compose 가 두 변수를 기본값 없이 참조하므로 없으면 빈 값이 컨테이너로 가고 `Settings`
+정수 검증에서 실패해 indexer 가 기동하지 않는다. 호스트 Ollama 를 쓰면 `OLLAMA_CONTEXT_LENGTH` 도
+같은 값 이상으로 맞춘다(runbook §2).
 
 ## 알려진 제약
 
 - LightRAG 서버(9621)는 인증이 없다. 모든 포트는 `127.0.0.1` 에만 바인딩한다. 쓰기 API 는 쓰지 않는다.
   indexer 와 같은 PostgreSQL workspace 를 공유하므로 쓰는 순간 manifest 와 어긋난다.
 - 호스트 실행(MCP · `--once`)은 첫 실행에 tiktoken 토크나이저 파일을 내려받는다(LLM API 호출은 아니다).
+- 종료 신호(SIGTERM · SIGINT)를 받으면 진행 중인 처리를 취소하고 종료한다. 취소된 챕터는
+  `chapter_sync` 에 `*_failed`(`insert_failed` · `reinsert_failed` · `delete_failed`)로 남고,
+  브랜치 HEAD 는 갱신되지 않아 다음 실행에서 다시 처리된다. `poll_cancelled` 로그가 찍힌다.
+  compose 의 indexer `stop_grace_period` 는 30초다(실측으로 조정). 종료 코드는 데몬 0, `--once` 취소 1.
 - 장애 시 가장 단순한 복구는 `down -v` 후 재인덱싱이다.
 
 더 자세한 실행 절차 · 로그 읽는 법 · 수동 검증은 [docs/PPS-346-runbook.md](docs/PPS-346-runbook.md) 를 본다.

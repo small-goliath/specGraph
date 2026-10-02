@@ -143,6 +143,9 @@ class GitSource:
             raise GitSourceError(
                 f"git {args[0]} 시간 초과({self.timeout_seconds}s) — 프로세스 그룹을 종료했다"
             ) from None
+        except asyncio.CancelledError:
+            await self._kill_group(proc)
+            raise
         if proc.returncode != 0:
             message = err.decode("utf-8", "replace").strip()
             raise GitSourceError(

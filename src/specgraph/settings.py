@@ -53,6 +53,7 @@ class Settings(BaseSettings):
         default="http://localhost:11434", validation_alias="LLM_BINDING_HOST"
     )
     llm_timeout: int = Field(default=600, gt=0, validation_alias="LLM_TIMEOUT")
+    llm_num_ctx: int = Field(default=16384, gt=0, validation_alias="OLLAMA_LLM_NUM_CTX")
     embedding_binding: Literal["ollama", "openai"] = Field(
         default="ollama", validation_alias="EMBEDDING_BINDING"
     )

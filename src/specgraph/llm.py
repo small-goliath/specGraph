@@ -137,8 +137,8 @@ def make_llm_func(
         }
         if _wants_json(kwargs):
             request["format"] = "json"
-        if options:
-            request["options"] = options
+        options.setdefault("num_ctx", settings.llm_num_ctx)
+        request["options"] = options
         for key in _DROPPED_KWARGS:
             kwargs.pop(key, None)
 

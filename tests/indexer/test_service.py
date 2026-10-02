@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 
@@ -848,3 +849,139 @@ async def test_branch_without_target_files_ends_with_zero_inserted_and_no_error(
     done = _events(caplog, "sync_done")
     assert len(done) == 1 and f"branch={branch} " in done[0] and "inserted=0" in done[0]
     assert rag.doc_ids() == []
+
+
+# --- 취소(PPS-349 AC7 · AC8) ---------------------------------------------------------
+
+ADMIN_CH1 = f"{ADMIN_BRANCH}:{ADMIN_PATH}#1"
+ADMIN_CH5 = f"{ADMIN_BRANCH}:{ADMIN_PATH}#5"
+
+
+async def _cancel_blocked_poll_and_expect_cancelled(service, rag) -> None:
+    """블로킹 훅에 걸린 poll 을 취소하고 CancelledError 가 그대로 전파됐는지까지 확인한다."""
+    task = asyncio.create_task(service.poll_once())
+    await asyncio.wait_for(rag.entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+
+def _chapter_actions(caplog) -> dict[str, str]:
+    return {_field(ln, "doc_id"): _field(ln, "action") for ln in _events(caplog, "chapter_sync")}
+
+
+async def test_cancel_during_second_chapter_logs_first_as_insert_and_second_as_insert_failed(
+    env, caplog
+):
+    _, service, rag, _, _ = env
+    rag.block_insert_on = {ADMIN_CH1}
+    caplog.set_level(logging.INFO)
+
+    await _cancel_blocked_poll_and_expect_cancelled(service, rag)
+
+    actions = _chapter_actions(caplog)
+    assert actions[f"{ADMIN_BRANCH}:{ADMIN_PATH}#0"] == "insert"
+    assert actions[ADMIN_CH1] == "insert_failed"
+    assert f"{ADMIN_BRANCH}:{ADMIN_PATH}#2" not in actions
+
+
+async def test_cancel_during_reinsert_logs_reinsert_failed(env, docs, caplog):
+    remote, service, rag, _, _ = env
+    await service.poll_once()
+    remote.commit(ADMIN_BRANCH, {ADMIN_PATH: docs["admin"].replace("D+2 이며", "D+3 이며")})
+    rag.block_insert_on = {ADMIN_CH5}
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+
+    await _cancel_blocked_poll_and_expect_cancelled(service, rag)
+
+    assert _chapter_actions(caplog)[ADMIN_CH5] == "reinsert_failed"
+
+
+async def test_cancel_during_branch_removal_logs_delete_failed_for_cancelled_chapter(env, caplog):
+    remote, service, rag, _, _ = env
+    await service.poll_once()
+    remote.delete_branch(PARTNER_BRANCH)
+    rag.block_delete_on = {PARTNER2}
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+
+    await _cancel_blocked_poll_and_expect_cancelled(service, rag)
+
+    assert _chapter_actions(caplog)[PARTNER2] == "delete_failed"
+
+
+async def test_cancel_during_chapter_delete_logs_delete_failed(env, docs, caplog):
+    remote, service, rag, _, _ = env
+    await service.poll_once()
+    remote.commit(ADMIN_BRANCH, {ADMIN_PATH: docs["admin"].split("## 5.")[0]})
+    rag.block_delete_on = {ADMIN_CH5}
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+
+    await _cancel_blocked_poll_and_expect_cancelled(service, rag)
+
+    assert _chapter_actions(caplog)[ADMIN_CH5] == "delete_failed"
+
+
+async def test_completed_delete_is_still_logged_as_delete(env, caplog):
+    remote, service, _, _, _ = env
+    await service.poll_once()
+    remote.delete_branch(PARTNER_BRANCH)
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+
+    await service.poll_once()
+
+    assert _chapter_actions(caplog)[PARTNER2] == "delete"
+
+
+async def test_cancelled_poll_propagates_cancelled_error_and_is_not_recorded_as_branch_failure(
+    env, caplog
+):
+    _, service, rag, _, _ = env
+    rag.block_insert_on = {ADMIN_CH1}
+    caplog.set_level(logging.INFO)
+
+    await _cancel_blocked_poll_and_expect_cancelled(service, rag)
+
+    assert _events(caplog, "branch_failed") == []
+
+
+async def test_cancelled_chapter_is_reprocessed_on_next_poll(env, caplog):
+    remote, service, rag, manifest, _ = env
+    rag.block_insert_on = {ADMIN_CH1}
+    await _cancel_blocked_poll_and_expect_cancelled(service, rag)
+    pending = manifest.records.get(ADMIN_CH1)  # 시작 기록 이후에 취소됐다
+    head_after_cancel = manifest.heads.get(ADMIN_BRANCH)
+    rag.block_insert_on = set()
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+
+    result = await service.poll_once()
+
+    assert pending is not None and pending.content_hash == ""  # PENDING 시작 기록
+    assert head_after_cancel is None
+    assert result.failed == {}
+    assert manifest.heads[ADMIN_BRANCH] == remote.shas[ADMIN_BRANCH]
+    assert _chapter_actions(caplog)[ADMIN_CH1] == "reinsert"  # 시작 기록 이후 취소 → reinsert
+    assert rag.statuses[ADMIN_CH1] == "processed"
+    assert manifest.records[ADMIN_CH1].content_commit_sha == remote.shas[ADMIN_BRANCH]
+
+
+async def test_cancelled_branch_removal_keeps_head_and_resumes_on_next_poll(env):
+    remote, service, rag, manifest, _ = env
+    await service.poll_once()
+    remote.delete_branch(PARTNER_BRANCH)
+    rag.block_delete_on = {PARTNER2}
+    await _cancel_blocked_poll_and_expect_cancelled(service, rag)
+    head_after_cancel = manifest.heads.get(PARTNER_BRANCH)
+    rag.block_delete_on = set()
+
+    result = await service.poll_once()
+
+    assert head_after_cancel is not None  # delete_branch_head 가 호출되지 않았다
+    assert result.removed == [PARTNER_BRANCH]
+    assert PARTNER_BRANCH not in manifest.heads
+    assert PARTNER2 not in manifest.records
+    assert PARTNER2 not in rag.statuses

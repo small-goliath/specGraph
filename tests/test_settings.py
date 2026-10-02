@@ -157,6 +157,29 @@ def test_unknown_binding_rejected(settings_env):
         load_settings()
 
 
+def test_llm_num_ctx_defaults_to_16384_and_reads_env(settings_env):
+    assert load_settings().llm_num_ctx == 16384
+
+    settings_env.setenv("OLLAMA_LLM_NUM_CTX", "8192")
+
+    assert load_settings().llm_num_ctx == 8192
+
+
+def test_llm_num_ctx_rejects_non_positive(settings_env):
+    settings_env.setenv("OLLAMA_LLM_NUM_CTX", "0")
+
+    with pytest.raises(ConfigError):
+        load_settings()
+
+
+def test_llm_timeout_default_and_env_override(settings_env):
+    assert load_settings().llm_timeout == 600
+
+    settings_env.setenv("LLM_TIMEOUT", "1800")
+
+    assert load_settings().llm_timeout == 1800
+
+
 def test_paths_are_paths(settings_env, tmp_path):
     settings_env.setenv("SPECGRAPH_CACHE_DIR", str(tmp_path / "c"))
 

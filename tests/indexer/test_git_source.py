@@ -74,6 +74,46 @@ async def test_hung_git_with_grandchild_holding_pipes_is_killed_as_group(tmp_pat
             await asyncio.sleep(0.05)
 
 
+async def test_cancelled_git_call_kills_process_group(tmp_path, monkeypatch):
+    """취소(SIGTERM 종료 경로)돼도 git 과 그 손자 프로세스를 그룹째 정리한다."""
+    import time
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pid_file = tmp_path / "grandchild.pid"
+    fake_git = bin_dir / "git"
+    fake_git.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {pid_file}\nwait\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    source = GitSource(
+        repo_url="https://example.invalid/product-docs.git",
+        cache_dir=tmp_path / "mirror",
+        token=None,
+        timeout_seconds=60,  # 시간 초과가 아니라 취소로만 끝나게 한다
+    )
+
+    with _kill_grandchild_on_exit(pid_file):
+        task = asyncio.create_task(source.list_branches())
+        deadline = time.monotonic() + 5
+        while not (pid_file.exists() and pid_file.read_text(encoding="utf-8").strip()):
+            if time.monotonic() >= deadline:
+                task.cancel()
+                pytest.fail("가짜 git 이 손자를 만들지 못했다")
+            await asyncio.sleep(0.02)
+        grandchild = int(pid_file.read_text(encoding="utf-8").strip())
+        assert grandchild > 1  # kill 대상 pid 가드
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+        deadline = time.monotonic() + 3
+        while _is_alive(grandchild):
+            if time.monotonic() >= deadline:
+                pytest.fail("취소 후에도 손자 프로세스가 살아 있다 — 프로세스 그룹을 죽이지 않았다")
+            await asyncio.sleep(0.05)
+
+
 def _is_alive(pid: int) -> bool:
     """살아 있는 프로세스인가. 좀비(``Z``, 아직 reap 되지 않은 종료 프로세스)는 종료로 본다.
 

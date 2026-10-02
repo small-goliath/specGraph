@@ -22,6 +22,7 @@ FakeLightRAG 는 호출을 ``calls`` 에 기록하고, 챕터 삽입 · 삭제 �
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from specgraph.errors import IndexingError
@@ -49,6 +50,11 @@ class FakeLightRAG:
     # 이전 관계를 지우는 단계(어댑터의 adelete_by_relation 이 status=fail 을 돌려주는 경우)를 한 번
     # 실패시킨다. 실패하면 그 호출은 그래프를 바꾸지 않는다.
     fail_relation_delete_once: bool = False
+    # 취소 테스트용 블로킹 훅(PPS-349): doc_id 에 마커가 들어 있는 삽입 · 삭제는 ``entered`` 를
+    # 세운 뒤 영원히 기다린다 — 취소돼야만 빠져나온다. 기본값은 비활성이다.
+    block_insert_on: set[str] = field(default_factory=set)
+    block_delete_on: set[str] = field(default_factory=set)
+    entered: asyncio.Event = field(default_factory=asyncio.Event)
     extracted_entities: set[str] = field(default_factory=set)
     retrieval: Retrieval | None = None
 
@@ -74,8 +80,14 @@ class FakeLightRAG:
                 return True
         return any(marker in doc_id for marker in self.fail_on)
 
+    async def _block_if_requested(self, doc_id: str, markers: set[str]) -> None:
+        if any(marker in doc_id for marker in markers):
+            self.entered.set()
+            await asyncio.Event().wait()
+
     async def insert_chapter(self, doc_id: str, blocks: list[str]) -> None:
         self.calls.append(("insert", doc_id))
+        await self._block_if_requested(doc_id, self.block_insert_on)
         if doc_id in self.statuses:  # 같은 id 는 상태와 무관하게 무시된다
             if self.statuses[doc_id] != PROCESSED:
                 raise IndexingError(f"fake: doc_id={doc_id} status={self.statuses[doc_id]}")
@@ -89,6 +101,7 @@ class FakeLightRAG:
 
     async def delete_chapter(self, doc_id: str) -> None:
         self.calls.append(("delete", doc_id))
+        await self._block_if_requested(doc_id, self.block_delete_on)
         if doc_id not in self.statuses:  # not_found
             return
         self._llm(self.llm_calls_per_delete)

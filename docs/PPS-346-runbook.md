@@ -64,6 +64,25 @@ LLM_BINDING_HOST=http://host.docker.internal:11434
 EMBEDDING_BINDING_HOST=http://host.docker.internal:11434
 ```
 
+**컨텍스트 크기(PPS-349).** 인덱서는 요청마다 `options.num_ctx=OLLAMA_LLM_NUM_CTX`(기본 16384)를
+보낸다. Ollama 서버 기본(4096)에서는 긴 추출 출력이 창을 채워 앞부분(지시문)이 잘리고
+(`slot context shift`) 생성이 끝나지 않는다. 호스트 Ollama 는 서버 쪽 한도도 맞춘다
+(`OLLAMA_CONTEXT_LENGTH=16384 ollama serve`). 메모리: KV 캐시는 `num_ctx` 에 비례하고
+`OLLAMA_NUM_PARALLEL` 이 1 이 아니면 슬롯 수만큼 곱해진다 — 16GB 맥에서는 1 을 유지하고, 모자라면
+`OLLAMA_LLM_NUM_CTX` 를 `.env` 에서 낮춘다. 임베딩 호출에는 `num_ctx` 를 지정하지 않는다
+(청크가 `CHUNK_SIZE` 이하라 필요 근거를 못 찾았다. 임베딩 경고가 보이면 후속 티켓).
+
+**기존 `deploy/.env` 는 두 줄을 추가해야 한다.** compose 가 `LLM_TIMEOUT` · `OLLAMA_LLM_NUM_CTX` 를
+기본값 없이 참조하므로 없으면 빈 값이 컨테이너로 가고 `Settings` 정수 검증이 실패해 indexer 가
+기동하지 않는다(`LLM_TIMEOUT=1800`, `OLLAMA_LLM_NUM_CTX=16384`; `deploy/.env.example` 참고).
+렌더링 확인(읽기 전용): `docker compose -f deploy/docker-compose.yml --env-file deploy/.env config`.
+**주의:** `config` 출력에는 렌더링된 `POSTGRES_PASSWORD` · git 토큰이 평문으로 들어 있다. 티켓 ·
+로그 · 채팅에 붙이지 말고, 공유가 필요하면 해당 값을 지운 뒤 붙인다.
+
+`x-model-env` 는 lightrag 서버(질의 경로)에도 적용되므로 `LLM_TIMEOUT` · `OLLAMA_LLM_NUM_CTX` 변경이
+서버의 타임아웃 · 컨텍스트에도 함께 반영된다. 서버 이미지의 기존 기본값은 확인하지 못했다 — 실스택에서
+`docker compose ... logs lightrag` 로 서버가 쓰는 타임아웃 · 컨텍스트가 의도한 값인지 확인한다.
+
 ### 모델 전환 (AC2 — env 만 변경)
 
 - prod LLM: `LLM_MODEL=qwen3:30b-a3b`, `OLLAMA_PULL_MODELS="qwen3:30b-a3b bge-m3"`.
@@ -109,7 +128,9 @@ claude                                 # 저장소 루트에서 실행 → .mcp.
 | event | 필드 | 쓰임 |
 |---|---|---|
 | `poll` | branches · new · changed · deleted · unchanged | 주기마다 브랜치 diff |
-| `chapter_sync` | doc_id · action(insert/reinsert/delete/skip, 실패 시 insert_failed/reinsert_failed) · content_hash · llm_calls | AC9 — skip 은 항상 `llm_calls=0`. 브랜치 뒷단계가 실패해도 처리한 챕터는 남는다 |
+| `chapter_sync` | doc_id · action(insert/reinsert/delete/skip, 실패 · 취소 시 insert_failed/reinsert_failed/delete_failed) · content_hash · llm_calls | AC9 — skip 은 항상 `llm_calls=0`. 브랜치 뒷단계가 실패하거나 종료 신호로 취소돼도 처리한 챕터는 남는다(취소된 챕터는 `*_failed`) |
+| `poll_cancelled` | once | 종료 신호로 진행 중인 `poll_once` 를 취소했다(PPS-349). 브랜치 HEAD 는 갱신되지 않아 취소된 챕터는 다음 실행에서 다시 처리된다 |
+| `poll_cancel_cleanup_failed` | error_type · error | 취소 처리 중 poll 의 정리 코드가 예외를 던졌다(종료는 계속 진행) |
 | `extract` | doc_id · screens · policies · section_refs · cross_doc_refs · dangling_refs | M7 추출 통계. dangling_refs 는 아직 없는 챕터로의 참조(엣지 미생성) |
 | `sync_done` | branch · head · elapsed_s · llm_calls_total · inserted · reinserted · deleted · skipped | AC12 측정. llm_calls_total = 그 브랜치 chapter_sync llm_calls 합 |
 | `branch_removed` | branch · chapters | AC6 |
@@ -227,6 +248,34 @@ N8 에서 모델 카드 원문으로 재확인한다.
   없는 § 를 가리키는 참조는 엣지를 만들지 않고(`dangling_refs`), 그 챕터가 생기면 재해석으로 잇는다.
 - **삭제 시 재구성 LLM 호출:** 변경 챕터를 지울 때 LightRAG 가 공유 엔티티 요약을 다시 만들 수 있다.
   그 호출은 변경 챕터 doc_id 로 귀속되어 로그에 남는다(무변경 챕터는 LightRAG 무접촉).
+- **LLM 타임아웃 두 경로(PPS-349):** `LLM_TIMEOUT=T` 가 ① specgraph 의 Ollama HTTP 읽기 한도(T)와
+  ② LightRAG 워커 한도(2T, LightRAG 이 import 시점에 환경변수 `LLM_TIMEOUT` 에서 읽는다)를 정한다.
+  compose 가 `LLM_TIMEOUT` 을 컨테이너로 전달하므로 둘은 같은 값에서 나온다(기본 `.env.example` 1800
+  → 워커 3,600초). 멈춘 호출은 T 초 뒤에야 드러난다. 확인: 추출이 시작될 때 LightRAG 이 찍는
+  `extract LLM func … Timeouts` 로그의 `Func: <T>s` — **기동 직후가 아니라 추출 시작 시 찍힌다**
+  (`docker compose ... logs indexer | grep Timeouts`, 그 전에는 나오지 않는다).
+- **종료와 재처리(PPS-349):** SIGTERM · SIGINT 를 받으면 `run_loop` 가 진행 중인 `poll_once` 를
+  취소한다(데몬 종료 코드 0, `--once` 취소 1, 락 충돌 2). 취소된 챕터는 `chapter_sync` 에
+  `*_failed` 로 남고, 그 브랜치의 HEAD 는 갱신되지 않아 다음 실행에서 시작 기록(PENDING)이 있는
+  챕터를 다시 처리한다 — 시작 기록 이후에 취소된 챕터는 `reinsert`(LightRAG 문서 삭제 → 삽입, 없으면
+  `not_found` 허용), 시작 기록 이전에 취소된 챕터는 기록이 없으므로 `insert` 다. `docker stop` 유예는
+  indexer `stop_grace_period: 30s` — 취소 전파 + `store.close` + `manifest.close` 가 이 안에 끝나지
+  않으면 SIGKILL(137)이다. 30초는 추정이므로 **실측으로 조정한다.** LightRAG 내부 워커 태스크로
+  취소가 전파되는지, 취소 후 LightRAG `doc_status` · 공유 노드 상태가 재처리로 정리되는지는 단위
+  테스트(가짜)로 검증할 수 없다 — 아래 수동 검증으로 확인한다.
+- **수동 SIGTERM 검증(실스택, 사용자 승인 후 · 호스트 GPU 부하 주의):**
+  1. 큰 챕터가 처리 중일 때(`logs -f indexer` 에 `extract` 이전) `docker compose ... stop indexer`
+     (또는 호스트 실행이면 포그라운드에서 Ctrl-C, 또는 `kill -TERM $(pgrep -f 'specgraph.indexer')`)를
+     보낸다. pid 는 `pgrep -f 'specgraph.indexer'` 로 확인하고 대상이 하나인지 본다.
+     **`pkill -f specgraph` 같은 광범위 패턴은 쓰지 않는다**(MCP 서버 등 무관한 프로세스까지 죽는다).
+  2. 30초 안에 종료 코드가 0 인지 확인한다(`docker compose ... ps -a`, 137 이면 유예 부족).
+  3. 로그에 `event=poll_cancelled` 와 취소 챕터의 `chapter_sync action=*_failed` 가 있는지, 앞서 끝낸
+     챕터는 `insert` 로 남았는지 본다.
+  4. `up -d indexer` 로 재기동해 취소된 챕터가 `reinsert`/`insert` 로 완료되고 `sync_done` 이 찍히며
+     MCP `get_chapter` 가 새 내용을 돌려주는지 확인한다.
+- **취소와 고아 엔티티(알려진 한계, 후속 티켓 후보):** 챕터 삭제가 manifest 에서 끝난 뒤 `_delete_orphans`
+  중에 취소되면 고아 후보가 메모리에만 있어 그 고아 엔티티가 다음 주기에 정리되지 않는다. PPS-349 에서는
+  고치지 않는다.
 - **AC12 경계:** 네이티브 Ollama 에서도 10분 경계선일 수 있다. 미달이면 측정치와 병목을 그대로
   보고한다(조건 완화는 사용자 결정).
 - **custom KG 쓰기는 LightRAG 문서 단위 복구 보장 밖이다**(LightRAG `ainsert_custom_kg` 경고). 장애 시

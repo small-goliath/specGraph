@@ -18,6 +18,8 @@ x-model-env: &model-env
   LLM_MODEL: ${LLM_MODEL}
   LLM_BINDING_HOST: ${LLM_BINDING_HOST}
   OLLAMA_LLM_THINK: ${OLLAMA_LLM_THINK}
+  OLLAMA_LLM_NUM_CTX: ${OLLAMA_LLM_NUM_CTX}
+  LLM_TIMEOUT: ${LLM_TIMEOUT}
   EMBEDDING_BINDING: ${EMBEDDING_BINDING}
   EMBEDDING_MODEL: ${EMBEDDING_MODEL}
   EMBEDDING_DIM: ${EMBEDDING_DIM}
@@ -169,6 +171,9 @@ services:
       - indexer-data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # 종료 신호에 진행 중인 처리를 취소하고 store · manifest 를 닫을 시간(기본 10초면 SIGKILL 137).
+    # 실측으로 조정한다(runbook §8).
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:

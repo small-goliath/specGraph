@@ -257,20 +257,25 @@ N8 에서 모델 카드 원문으로 재확인한다.
 - **종료와 재처리(PPS-349):** SIGTERM · SIGINT 를 받으면 `run_loop` 가 진행 중인 `poll_once` 를
   취소한다(데몬 종료 코드 0, `--once` 취소 1, 락 충돌 2). 취소된 챕터는 `chapter_sync` 에
   `*_failed` 로 남고, 그 브랜치의 HEAD 는 갱신되지 않아 다음 실행에서 시작 기록(PENDING)이 있는
-  챕터를 다시 처리한다 — 시작 기록 이후에 취소된 챕터는 `reinsert`(LightRAG 문서 삭제 → 삽입, 없으면
-  `not_found` 허용), 시작 기록 이전에 취소된 챕터는 기록이 없으므로 `insert` 다. `docker stop` 유예는
+  챕터를 다시 처리한다. 처리 방식(`insert`/`reinsert`)은 시작 기록 위치가 아니라 manifest 의 기존
+  기록으로 정해진다 — manifest 에 이전 완료본이 있는 **기존 챕터**는 취소 시점과 무관하게 이전 해시가
+  남아 `reinsert`(LightRAG 문서 삭제 → 삽입, 없으면 `not_found` 허용)이고, `insert` 는 manifest 에
+  기록이 없는 **신규 챕터**뿐이다. `docker stop` 유예는
   indexer `stop_grace_period: 30s` — 취소 전파 + `store.close` + `manifest.close` 가 이 안에 끝나지
   않으면 SIGKILL(137)이다. 30초는 추정이므로 **실측으로 조정한다.** LightRAG 내부 워커 태스크로
   취소가 전파되는지, 취소 후 LightRAG `doc_status` · 공유 노드 상태가 재처리로 정리되는지는 단위
   테스트(가짜)로 검증할 수 없다 — 아래 수동 검증으로 확인한다.
 - **수동 SIGTERM 검증(실스택, 사용자 승인 후 · 호스트 GPU 부하 주의):**
   1. 큰 챕터가 처리 중일 때(`logs -f indexer` 에 `extract` 이전) `docker compose ... stop indexer`
-     (또는 호스트 실행이면 포그라운드에서 Ctrl-C, 또는 `kill -TERM $(pgrep -f 'specgraph.indexer')`)를
-     보낸다. pid 는 `pgrep -f 'specgraph.indexer'` 로 확인하고 대상이 하나인지 본다.
-     **`pkill -f specgraph` 같은 광범위 패턴은 쓰지 않는다**(MCP 서버 등 무관한 프로세스까지 죽는다).
+     (또는 호스트 실행이면 포그라운드에서 Ctrl-C)를 보낸다. 호스트에서 백그라운드로 돌고 있다면
+     `pgrep -fl 'specgraph-indexer|-m specgraph\.indexer'` 로 pid 를 **눈으로 확인**해 대상이 인덱서
+     하나인지 본 뒤 `kill -TERM <pid>` 를 쓴다. `uv run specgraph-indexer` 로 띄웠다면 uv 래퍼와 파이썬
+     자식이 함께 보이니 이 경우에는 포그라운드 Ctrl-C 를 쓴다. `pgrep` 결과를 `kill` 에 한 줄로
+     넘기지 않는다(`pgrep -f` 는 정규식이라 `vim src/specgraph/indexer/...` 같은 무관한 프로세스도
+     매치할 수 있다). **`pkill -f specgraph` 같은 광범위 패턴은 쓰지 않는다.**
   2. 30초 안에 종료 코드가 0 인지 확인한다(`docker compose ... ps -a`, 137 이면 유예 부족).
   3. 로그에 `event=poll_cancelled` 와 취소 챕터의 `chapter_sync action=*_failed` 가 있는지, 앞서 끝낸
-     챕터는 `insert` 로 남았는지 본다.
+     챕터는 신규면 `insert`, 기존이면 `reinsert` 로 남았는지 본다.
   4. `up -d indexer` 로 재기동해 취소된 챕터가 `reinsert`/`insert` 로 완료되고 `sync_done` 이 찍히며
      MCP `get_chapter` 가 새 내용을 돌려주는지 확인한다.
 - **취소와 고아 엔티티(알려진 한계, 후속 티켓 후보):** 챕터 삭제가 manifest 에서 끝난 뒤 `_delete_orphans`

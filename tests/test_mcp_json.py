@@ -5,8 +5,6 @@ ROOT = Path(__file__).parents[1]
 
 REQUIRED_ENV = {
     "SPECGRAPH_REPO_URL",
-    "LLM_MODEL",
-    "LLM_BINDING_HOST",
     "EMBEDDING_MODEL",
     "EMBEDDING_BINDING_HOST",
     "RERANK_MODEL",
@@ -43,8 +41,16 @@ def test_mcp_json_targets_local_services_only():
     env = _server()["env"]
 
     assert "localhost" in env["POSTGRES_HOST"]
-    for key in ("LLM_BINDING_HOST", "EMBEDDING_BINDING_HOST", "RERANK_BINDING_HOST"):
+    for key in ("EMBEDDING_BINDING_HOST", "RERANK_BINDING_HOST"):
         assert "localhost" in env[key] or "127.0.0.1" in env[key]
+
+
+def test_mcp_json_has_no_llm_env():
+    """PPS-350 AC17: MCP 는 LLM 을 쓰지 않는다 — LLM_MODEL · LLM_BINDING_HOST 를 넘기지 않는다."""
+    env = _server()["env"]
+
+    assert "LLM_MODEL" not in env and "LLM_BINDING_HOST" not in env
+    assert not any(key.startswith("LLM_") for key in env)
 
 
 def test_mcp_json_has_no_secret_literals():
@@ -59,5 +65,5 @@ def test_mcp_json_model_names_have_no_literal_defaults():
     """A7: 모델명의 출처는 deploy/.env(.env.example) 하나다. .mcp.json 에 기본값을 두지 않는다."""
     env = _server()["env"]
 
-    for key in ("LLM_MODEL", "EMBEDDING_MODEL", "RERANK_MODEL"):
+    for key in ("EMBEDDING_MODEL", "RERANK_MODEL"):
         assert env[key] == f"${{{key}}}"

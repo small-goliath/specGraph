@@ -5,8 +5,9 @@ from specgraph.errors import InvalidArgumentError, SpecGraphError
 from specgraph.indexer.extract import DocumentRef, extract_chapter
 from specgraph.indexer.kg import build_chapter_kg
 from specgraph.lightrag_store import Retrieval, RetrievedChunk, RetrievedEntity, RetrievedRelation
+from specgraph.llm import LlmCallCounter
 from specgraph.manifest import ChapterRecord
-from specgraph.mcp_server.query_service import QueryResult, QueryService, Source
+from specgraph.mcp_server.query_service import EvidenceChunk, QueryResult, QueryService, Source
 
 ADMIN = DocumentRef("draft/settlr-admin-prd", "prd/settlr-admin-prd.md")
 PARTNER = DocumentRef("draft/settlr-partner-prd", "prd/settlr-partner-prd.md")
@@ -52,20 +53,9 @@ def manifest():
     return m
 
 
-class FakeLlm:
-    def __init__(self, answer="근거에 따른 답변"):
-        self.prompts = []
-        self.answer = answer
-
-    async def __call__(self, prompt, system_prompt=None, **kwargs):
-        self.prompts.append((prompt, system_prompt))
-        return self.answer
-
-
-def _service(manifest, retrieval, llm=None):
-    rag = FakeLightRAG(retrieval=retrieval)
-    llm = llm or FakeLlm()
-    return QueryService(rag=rag, manifest=manifest, llm=llm), rag, llm
+def _service(manifest, retrieval, counter=None):
+    rag = FakeLightRAG(retrieval=retrieval, counter=counter)
+    return QueryService(rag=rag, manifest=manifest), rag
 
 
 def _partner_only_retrieval():
@@ -76,29 +66,108 @@ def _partner_only_retrieval():
     )
 
 
-async def test_sources_include_doc_id_and_commit_sha(manifest):
-    service, _, _ = _service(manifest, _partner_only_retrieval())
+async def test_query_service_requires_no_llm(manifest):
+    """PPS-350 AC17: 질의 서비스는 LLM 없이 만들어지고 동작한다."""
+    service = QueryService(FakeLightRAG(retrieval=_partner_only_retrieval()), manifest)
 
     result = await service.query("파트너 정산 주기 근거는?", "mix", None)
 
     assert isinstance(result, QueryResult)
-    assert result.answer == "근거에 따른 답변"
+    assert Source(PARTNER2, "sha-ptn") in result.sources
+
+
+async def test_sources_include_doc_id_and_commit_sha(manifest):
+    service, _ = _service(manifest, _partner_only_retrieval())
+
+    result = await service.query("파트너 정산 주기 근거는?", "mix", None)
+
     assert Source(PARTNER2, "sha-ptn") in result.sources
     assert all(s.doc_id and s.commit_sha for s in result.sources)
 
 
-async def test_cross_branch_reference_expansion_adds_admin_doc(manifest):
-    service, _, llm = _service(manifest, _partner_only_retrieval())
+async def test_result_has_no_answer_and_chunks_carry_doc_id_and_commit_sha(manifest):
+    """PPS-350 AC14: answer 가 없고 청크 본문이 doc_id · commit_sha 와 함께 돌아온다."""
+    service, _ = _service(manifest, _partner_only_retrieval())
+
+    result = await service.query("파트너 정산 주기 근거는?", "mix", None)
+
+    assert not hasattr(result, "answer")
+    assert result.chunks[0] == EvidenceChunk(
+        doc_id=PARTNER2,
+        commit_sha="sha-ptn",
+        content="정산 주기는 Admin PRD §5 를 따른다.",
+        expanded=False,
+    )
+    assert result.no_evidence is False
+
+
+async def test_entities_and_relations_carry_visible_sources_with_commit_sha(manifest):
+    retrieval = Retrieval(
+        chunks=[],
+        entities=[RetrievedEntity("정산 주기", "concept", "D+2 정산", (PARTNER2, ADMIN5))],
+        relations=[RetrievedRelation("PTN-P-04", "정산 주기", "k", "화면이 보여준다", (PARTNER2,))],
+    )
+    service, _ = _service(manifest, retrieval)
+
+    result = await service.query("정산 주기?", "mix", None)
+
+    entity = result.entities[0]
+    assert (entity.name, entity.entity_type, entity.description) == (
+        "정산 주기",
+        "concept",
+        "D+2 정산",
+    )
+    assert entity.sources == (Source(PARTNER2, "sha-ptn"), Source(ADMIN5, "sha-admin"))
+    relation = result.relations[0]
+    assert (relation.src, relation.tgt, relation.keywords) == ("PTN-P-04", "정산 주기", "k")
+    assert relation.sources == (Source(PARTNER2, "sha-ptn"),)
+    data = result.to_dict()
+    assert data["entities"][0]["sources"][1] == {"doc_id": ADMIN5, "commit_sha": "sha-admin"}
+    assert data["relations"][0]["description"] == "화면이 보여준다"
+
+
+async def test_entity_with_only_hidden_sources_is_dropped(manifest):
+    """PPS-350 AC15: 보이는 출처가 하나도 없는 엔티티 · 관계 · 청크는 응답에서 뺀다."""
+    from dataclasses import replace
+
+    manifest.records[ADMIN5] = replace(
+        manifest.records[ADMIN5], content_hash="", content_commit_sha=""
+    )
+    retrieval = Retrieval(
+        chunks=[
+            RetrievedChunk(ADMIN5, "숨겨진 챕터 본문"),
+            RetrievedChunk(PARTNER2, "보이는 본문"),
+        ],
+        entities=[
+            RetrievedEntity("숨김만", "concept", "숨겨진 출처만", (ADMIN5,)),
+            RetrievedEntity("섞임", "concept", "보이는 출처 포함", (ADMIN5, PARTNER2)),
+        ],
+        relations=[RetrievedRelation("a", "b", "k", "숨겨진 관계", (ADMIN5,))],
+    )
+    service, _ = _service(manifest, retrieval)
+
+    result = await service.query("질문", "mix", None)
+
+    assert [c.doc_id for c in result.chunks] == [PARTNER2]
+    assert [e.name for e in result.entities] == ["섞임"]
+    assert result.entities[0].sources == (Source(PARTNER2, "sha-ptn"),)
+    assert result.relations == []
+    assert "숨겨진" not in str(result.to_dict())
+
+
+async def test_expanded_reference_chapter_is_returned_as_chunk(manifest):
+    """참조 확장(REFERS_TO 한 단계)으로 추가된 챕터는 expanded=True 청크로 돌아온다."""
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     result = await service.query("파트너 정산 정책 근거는?", "mix", None)
 
-    doc_ids = [s.doc_id for s in result.sources]
-    assert doc_ids[0] == PARTNER2
-    assert ADMIN5 in doc_ids
+    assert [s.doc_id for s in result.sources] == [PARTNER2, ADMIN5]
     assert Source(ADMIN5, "sha-admin") in result.sources
-    prompt = llm.prompts[0][0]
-    assert "정산 주기는 D+2 (P-14.3)." in prompt
-    assert ADMIN5 in prompt and PARTNER2 in prompt
+    expanded = [c for c in result.chunks if c.expanded]
+    assert [c.doc_id for c in expanded] == [ADMIN5]
+    assert expanded[0].commit_sha == "sha-admin"
+    assert "정산 주기는 D+2 (P-14.3)." in expanded[0].content
+    assert result.chunks[0].doc_id == PARTNER2 and result.chunks[0].expanded is False
 
 
 async def test_branch_filter_keeps_only_branch_doc_ids(manifest):
@@ -110,18 +179,18 @@ async def test_branch_filter_keeps_only_branch_doc_ids(manifest):
         entities=[RetrievedEntity("파트너", "concept", "사업자", (PARTNER1, ADMIN3))],
         relations=[RetrievedRelation("a", "b", "k", "관계", (PARTNER1,))],
     )
-    service, _, llm = _service(manifest, retrieval)
+    service, _ = _service(manifest, retrieval)
 
     result = await service.query("질문", "hybrid", "draft/settlr-admin-prd")
 
     assert result.sources
     assert all(s.doc_id.startswith("draft/settlr-admin-prd:") for s in result.sources)
-    assert "파트너 포털." not in llm.prompts[0][0]
-    assert "관계" not in llm.prompts[0][0]
+    assert [c.content for c in result.chunks if not c.expanded] == ["조회 조건은 §5.2."]
+    assert result.entities == [] and result.relations == []
 
 
 async def test_branch_filter_blocks_reference_expansion_outside_branch(manifest):
-    service, _, _ = _service(manifest, _partner_only_retrieval())
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     result = await service.query("질문", "mix", "draft/settlr-partner-prd")
 
@@ -130,34 +199,68 @@ async def test_branch_filter_blocks_reference_expansion_outside_branch(manifest)
 
 async def test_same_document_reference_expanded(manifest):
     retrieval = Retrieval(chunks=[RetrievedChunk(ADMIN3, "조회 조건은 §5.2.")])
-    service, _, _ = _service(manifest, retrieval)
+    service, _ = _service(manifest, retrieval)
 
     result = await service.query("질문", "naive", "draft/settlr-admin-prd")
 
     assert [s.doc_id for s in result.sources] == [ADMIN3, ADMIN5]
 
 
-async def test_no_sources_returns_without_llm_call(manifest):
-    service, _, llm = _service(manifest, Retrieval())
+async def test_no_evidence_returns_empty_lists_and_flag_without_error(manifest):
+    """PPS-350 AC16: 근거가 없으면 빈 목록 + no_evidence=True 로 정상 반환한다."""
+    service, _ = _service(manifest, Retrieval())
 
     result = await service.query("질문", "mix", None)
 
+    assert result.chunks == [] and result.entities == [] and result.relations == []
     assert result.sources == []
-    assert llm.prompts == []
-    assert result.answer
+    assert result.no_evidence is True
+    data = result.to_dict()
+    assert data["no_evidence"] is True and "answer" not in data
 
 
 async def test_retrieval_called_with_mode(manifest):
-    service, rag, _ = _service(manifest, _partner_only_retrieval())
+    service, rag = _service(manifest, _partner_only_retrieval())
 
     await service.query("질문", "local", None)
 
-    assert rag.calls[0] == ("retrieve", "질문", "local")
+    assert rag.calls[0] == ("retrieve", "질문", "local", (), ())
+
+
+async def test_query_forwards_keywords_to_retrieval(manifest):
+    """PPS-350 AC11: 공백 · 빈 항목을 정리한 키워드가 그대로 어댑터로 간다."""
+    service, rag = _service(manifest, _partner_only_retrieval())
+
+    await service.query(
+        "질문", "mix", None, hl_keywords=[" 정산 정책 ", ""], ll_keywords=["P-14.3", "  "]
+    )
+
+    assert rag.calls[0] == ("retrieve", "질문", "mix", ("정산 정책",), ("P-14.3",))
+
+
+async def test_query_without_keywords_passes_empty_lists_to_adapter(manifest):
+    """키워드 생략 시 질의문 보정은 어댑터(lightrag_store) 가 한다 — 서비스는 비운 채로 넘긴다."""
+    service, rag = _service(manifest, _partner_only_retrieval())
+
+    await service.query("질문", "mix", None)
+
+    assert rag.calls[0][3] == () and rag.calls[0][4] == ()
+
+
+async def test_query_makes_no_llm_calls(manifest):
+    """PPS-350 AC12: 질의 경로의 LLM 호출은 0 건이다."""
+    counter = LlmCallCounter()
+    service, _ = _service(manifest, _partner_only_retrieval(), counter=counter)
+
+    await service.query("질문", "mix", None, ll_keywords=["정산"])
+    await service.query("질문", "mix", None)
+
+    assert counter.total == 0
 
 
 @pytest.mark.parametrize("mode", ["bypass", "graph", ""])
 async def test_invalid_mode_rejected(manifest, mode):
-    service, rag, _ = _service(manifest, _partner_only_retrieval())
+    service, rag = _service(manifest, _partner_only_retrieval())
 
     with pytest.raises(InvalidArgumentError) as exc:
         await service.query("질문", mode, None)
@@ -166,14 +269,14 @@ async def test_invalid_mode_rejected(manifest, mode):
 
 
 async def test_empty_question_rejected(manifest):
-    service, _, _ = _service(manifest, _partner_only_retrieval())
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     with pytest.raises(InvalidArgumentError):
         await service.query("   ", "mix", None)
 
 
 async def test_branch_filter_drops_entities_and_relations_mixed_with_other_branches(manifest):
-    """C10: 다른 브랜치 출처가 섞인 엔티티 · 관계 설명은 브랜치 한정 질의 프롬프트에 넣지 않는다."""
+    """C10: 다른 브랜치 출처가 섞인 엔티티 · 관계 설명은 브랜치 한정 질의 응답에 넣지 않는다."""
     retrieval = Retrieval(
         chunks=[RetrievedChunk(ADMIN3, "조회 조건은 §5.2.")],
         entities=[
@@ -185,22 +288,28 @@ async def test_branch_filter_drops_entities_and_relations_mixed_with_other_branc
             RetrievedRelation("ADM-03", "정산", "k", "어드민 관계", (ADMIN3,)),
         ],
     )
-    service, _, llm = _service(manifest, retrieval)
+    service, _ = _service(manifest, retrieval)
 
-    await service.query("질문", "mix", "draft/settlr-admin-prd")
+    result = await service.query("질문", "mix", "draft/settlr-admin-prd")
 
-    prompt = llm.prompts[0][0]
-    assert "어드민 전용 설명" in prompt and "어드민 관계" in prompt
-    assert "파트너 문서가 섞인 설명" not in prompt and "섞인 관계" not in prompt
+    assert [e.description for e in result.entities] == ["어드민 전용 설명"]
+    assert [r.description for r in result.relations] == ["어드민 관계"]
 
 
 async def test_result_to_dict_has_sources_with_commit_sha(manifest):
-    service, _, _ = _service(manifest, _partner_only_retrieval())
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     data = (await service.query("질문", "mix", None)).to_dict()
 
-    assert data["answer"]
+    assert "answer" not in data
     assert data["sources"][0] == {"doc_id": PARTNER2, "commit_sha": "sha-ptn"}
+    assert data["chunks"][0] == {
+        "doc_id": PARTNER2,
+        "commit_sha": "sha-ptn",
+        "content": "정산 주기는 Admin PRD §5 를 따른다.",
+        "expanded": False,
+    }
+    assert data["mode"] == "mix" and data["branch"] is None and data["no_evidence"] is False
 
 
 def _pending_record(doc_id, text, *, commit_sha, content_commit_sha):
@@ -221,7 +330,7 @@ async def test_query_excludes_pending_record_from_sources(manifest):
     manifest.records[PARTNER2] = _pending_record(
         PARTNER2, "## 2. PTN-P-04 정산 조회\n새 본문", commit_sha="sha-new", content_commit_sha=""
     )
-    service, _, llm = _service(manifest, _partner_only_retrieval())
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     result = await service.query("파트너 정산 주기 근거는?", "mix", None)
 
@@ -234,7 +343,7 @@ async def test_query_source_sha_uses_completed_commit_during_reinsert(manifest):
     manifest.records[PARTNER2] = _pending_record(
         PARTNER2, "## 2. 직전 완료본", commit_sha="sha-done", content_commit_sha="sha-done"
     )
-    service, _, _ = _service(manifest, _partner_only_retrieval())
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     result = await service.query("파트너 정산 주기 근거는?", "mix", None)
 
@@ -257,7 +366,7 @@ async def test_query_reference_expansion_ignores_pending_kg_keys(manifest):
     manifest.records[PARTNER2] = replace(
         pending, kg_keys=KgKeys(PARTNER2, ((PARTNER2, ADMIN5),), "anchor")
     )
-    service, _, _ = _service(manifest, _partner_only_retrieval())
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     result = await service.query("파트너 정산 정책 근거는?", "mix", None)
 
@@ -270,7 +379,7 @@ async def test_query_reference_expansion_skips_hidden_target(manifest):
     manifest.records[ADMIN5] = replace(
         manifest.records[ADMIN5], content_hash="", content_commit_sha=""
     )
-    service, _, _ = _service(manifest, _partner_only_retrieval())
+    service, _ = _service(manifest, _partner_only_retrieval())
 
     result = await service.query("파트너 정산 정책 근거는?", "mix", None)
 

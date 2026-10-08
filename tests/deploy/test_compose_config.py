@@ -104,6 +104,20 @@ def test_env_example_non_thinking_llm(env_example):
     assert env_example["OLLAMA_LLM_THINK"] == "false"
 
 
+def test_env_example_llm_binding_defaults_to_ollama(env_example):
+    """PPS-350 AC19: 템플릿 기본값은 ollama 다. claude_code 는 사용 조건을 주석으로 설명한다."""
+    assert env_example["LLM_BINDING"] == "ollama"
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert "claude_code" in text and "LLM_BINDING=" in text
+
+
+def test_compose_pins_llm_binding_ollama_for_containers(compose):
+    """PPS-350 D12: 컨테이너(lightrag · indexer)는 .env 의 LLM_BINDING 과 무관하게 ollama 리터럴이다
+    (컨테이너 안에는 구독 로그인이 없다 — 범위 밖 '컨테이너 lightrag 는 Ollama 유지')."""
+    for name in ("lightrag", "indexer"):
+        assert _env(compose["services"][name])["LLM_BINDING"] == "ollama", name
+
+
 def test_ports_bound_to_localhost_only(compose):
     for name, service in compose["services"].items():
         for port in service.get("ports", []):

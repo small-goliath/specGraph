@@ -11,10 +11,16 @@
    생긴다. LLM 없음).
    레코드 단위로 실패를 격리하고, 실패가 있으면 변경이 없는 다음 주기에도 다시 시도한다.
 5. 바뀐 게 있으면 "0. 용어" 사전으로 별칭 엔티티를 병합한다(실패하면 다음 주기에 다시 시도).
+   한도 초과로 끝난 poll 은 병합도 건너뛰고 다음 주기로 미룬다(``_glossary_pending``).
 
 브랜치 단위로 실패를 격리한다: 실패한 브랜치는 HEAD 를 갱신하지 않으므로 다음 주기에 재시도된다.
 HEAD 가 없어도 manifest 에 챕터가 남은 브랜치(부분 실패)는 "알려진 브랜치"로 보아, 원격에서
 지워지면 삭제하고 남아 있으면 다시 동기화한다.
+구독 사용량 한도(``LlmRateLimitedError``, PPS-350 D6)는 계정 단위라 다음 브랜치도 즉시 같은 오류를
+받는다. 그래서 그 브랜치를 같은 식으로 격리한 뒤 **같은 poll 의 나머지 브랜치는 건너뛰고**
+(``event=poll_rate_limited skipped=N``, ``PollResult.rate_limited``) 다음 poll 에서 평소처럼
+재시도한다.
+백오프 · 대기 창 계산은 이 범위 밖이다.
 
 챕터 삽입은 LightRAG 를 건드리기 **전에** manifest 에 시작 기록(``content_hash`` 가 빈 PENDING
 레코드, 이전 · 새 KG 관계를 합친 kg_keys)을 남긴다. 재삽입의 시작 기록은 직전 완료본의 본문 ·
@@ -38,7 +44,7 @@ from dataclasses import dataclass, field, replace
 
 from specgraph.blocks import split_blocks
 from specgraph.docid import build_doc_id
-from specgraph.errors import NonUtf8FileError, SpecGraphError
+from specgraph.errors import LlmRateLimitedError, NonUtf8FileError, SpecGraphError
 from specgraph.indexer.chapters import Chapter, split_chapters
 from specgraph.indexer.extract import DocumentRef, extract_chapter
 from specgraph.indexer.git_source import GitSourcePort
@@ -70,6 +76,9 @@ class PollResult:
     unchanged: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     error: str | None = None
+    # 구독 한도 초과로 이 poll 의 나머지 브랜치를 건너뛰었다(PPS-350 D6).
+    # 메모리 객체 — DB 스키마 변경 없음.
+    rate_limited: bool = False
 
     @property
     def changed(self) -> bool:
@@ -134,24 +143,38 @@ class IndexerService:
             unchanged=len(diff.unchanged),
         )
 
+        planned = [*diff.deleted, *diff.to_index]
         for branch in diff.deleted:
+            if result.rate_limited:
+                break
             try:
                 await self._remove_branch(branch)
                 result.removed.append(branch)
+            # 현재 RATE_LIMIT_MARKER 복원은 insert 경로만(lightrag_store) — 방어 코드.
+            except LlmRateLimitedError as exc:
+                self._poll_rate_limited(result, branch, exc, planned)
             except Exception as exc:  # noqa: BLE001 — 브랜치 단위 격리
                 self._branch_failed(result, branch, exc)
 
         for branch, sha in diff.to_index.items():
+            if result.rate_limited:
+                break
             try:
                 await self._sync_branch(branch, sha)
                 result.indexed.append(branch)
+            except LlmRateLimitedError as exc:
+                self._poll_rate_limited(result, branch, exc, planned)
             except Exception as exc:  # noqa: BLE001 — 브랜치 단위 격리
                 self._branch_failed(result, branch, exc)
 
         touched = result.changed or bool(result.failed)
         if touched or self._reconcile_pending:
             self._reconcile_pending = not await self._reconcile_refs()
-        if touched or self._glossary_pending:
+        if result.rate_limited:
+            # 한도 상태에서 용어 병합(amerge_entities, LLM 호출 가능)으로 claude 를 한 번 더 띄우지
+            # 않는다(D6). 이번 poll 은 건너뛰고 다음 poll 에서 다시 시도한다.
+            self._glossary_pending = True
+        elif touched or self._glossary_pending:
             try:
                 await self._apply_glossary()
                 self._glossary_pending = False
@@ -182,6 +205,25 @@ class IndexerService:
             exc_info=_traceback_for(exc),
             branch=branch,
             error_type=type(exc).__name__,
+            error=str(exc),
+        )
+
+    def _poll_rate_limited(
+        self, result: PollResult, branch: str, exc: Exception, planned: Sequence[str]
+    ) -> None:
+        """한도 초과 브랜치를 평소처럼 격리하고, 같은 poll 의 나머지 브랜치를 건너뛰게 표시한다.
+
+        한도는 계정 단위라 다음 브랜치도 즉시 같은 오류를 받는다(D6).
+        """
+        self._branch_failed(result, branch, exc)
+        result.rate_limited = True
+        skipped = len(planned) - list(planned).index(branch) - 1
+        log_event(
+            logger,
+            "poll_rate_limited",
+            logging.ERROR,
+            branch=branch,
+            skipped=skipped,
             error=str(exc),
         )
 

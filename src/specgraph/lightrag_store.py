@@ -26,6 +26,17 @@ custom KG 의 공유 노드 (SCREEN · POLICY · DOCUMENT)
     뒤에 기존 설명 · source_id · file_path 와 합쳐 되돌린다(``aedit_entity``, LLM 없음). 챕터 KG 를
     지우거나 바꿀 때는 그 챕터의 앵커 청크 · file_path 만 공유 노드에서 뺀다. LightRAG 엣지는
     무방향이므로, 다른 챕터가 소유한 같은 엣지(``keep``)는 지우지 않는다.
+
+질의 키워드 (PPS-350 AC11 · AC13)
+    ``retrieve`` 는 호출자가 준 ``hl_keywords`` · ``ll_keywords`` 를 ``QueryParam`` 의 같은 필드로
+    넘긴다(있으면 LightRAG 가 LLM 키워드 추출을 건너뛴다). 둘 다 비면 LightRAG 는 50자 이상 질의를
+    거부하므로 어댑터가 ``ll_keywords=[question]`` 을 직접 채운다 — LightRAG 규칙 흡수는 이 파일
+    한 곳이다.
+
+한도 초과 복원 (PPS-350 D5)
+    LightRAG 는 ``llm_model_func`` 의 예외를 전파하지 않고 doc 을 FAILED + ``error_msg`` 로 둔다.
+    ``insert_chapter`` 가 ``error_msg`` 에서 ``RATE_LIMIT_MARKER`` 를 찾으면
+    ``LlmRateLimitedError`` 로 되살려 인덱서가 poll 을 멈출 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -41,9 +52,14 @@ from urllib.parse import quote, unquote
 
 from specgraph.blocks import BLOCK_SEPARATOR, Measure, fit_blocks, join_blocks
 from specgraph.docid import parse_doc_id
-from specgraph.errors import ConfigError, IndexingError
+from specgraph.errors import ConfigError, IndexingError, LlmRateLimitedError
 from specgraph.kg_model import KgKeys, KgPayload
-from specgraph.llm import LlmCallCounter, make_llm_func, openai_compatible_embed
+from specgraph.llm import (
+    RATE_LIMIT_MARKER,
+    LlmCallCounter,
+    make_llm_func,
+    openai_compatible_embed,
+)
 from specgraph.log import log_event
 from specgraph.settings import Settings
 
@@ -163,7 +179,14 @@ class LightRagPort(Protocol):
 
     async def merge_entities(self, sources: list[str], target: str) -> None: ...
 
-    async def retrieve(self, question: str, mode: str, top_k: int | None = None) -> Retrieval: ...
+    async def retrieve(
+        self,
+        question: str,
+        mode: str,
+        top_k: int | None = None,
+        hl_keywords: list[str] | None = None,
+        ll_keywords: list[str] | None = None,
+    ) -> Retrieval: ...
 
 
 def to_retrieval(data: dict[str, Any]) -> Retrieval:
@@ -310,14 +333,18 @@ class LightRagStore:
             "vector_storage": settings.vector_storage,
             "graph_storage": settings.graph_storage,
             "doc_status_storage": settings.doc_status_storage,
-            "llm_model_func": make_llm_func(settings, counter),
-            "llm_model_name": settings.llm_model,
             "embedding_func": make_embedding_func(settings),
             "rerank_model_func": make_rerank_func(settings),
             "addon_params": settings.lightrag_addon_params(),
             "chunk_token_size": settings.chunk_token_size,
             "enable_llm_cache_for_entity_extract": True,
         }
+        # LLM 함수를 밖에서 주면(MCP 의 비활성 스텁 · 테스트 가짜) LLM_MODEL 을 요구하지 않는다
+        # (D7 · D8).
+        if "llm_model_func" not in overrides:
+            kwargs["llm_model_func"] = make_llm_func(settings, counter)
+        if settings.llm_model:
+            kwargs["llm_model_name"] = settings.llm_model
         kwargs.update(overrides)
         rag = LightRAG(**kwargs)
         await rag.initialize_storages()
@@ -372,7 +399,10 @@ class LightRagStore:
         statuses = await self.rag.aget_docs_by_ids([doc_id])
         state, error = _status_fields(statuses.get(doc_id))
         if state != "processed":
-            raise IndexingError(f"LightRAG 삽입 실패 doc_id={doc_id} status={state} error={error}")
+            message = f"LightRAG 삽입 실패 doc_id={doc_id} status={state} error={error}"
+            if error and RATE_LIMIT_MARKER in str(error):
+                raise LlmRateLimitedError(message)
+            raise IndexingError(message)
 
     async def delete_chapter(self, doc_id: str) -> None:
         _ensure_deleted(await self.rag.adelete_by_doc_id(doc_id), f"doc_id={doc_id}")
@@ -493,10 +523,22 @@ class LightRagStore:
     async def merge_entities(self, sources: list[str], target: str) -> None:
         await self.rag.amerge_entities(sources, target)
 
-    async def retrieve(self, question: str, mode: str, top_k: int | None = None) -> Retrieval:
+    async def retrieve(
+        self,
+        question: str,
+        mode: str,
+        top_k: int | None = None,
+        hl_keywords: list[str] | None = None,
+        ll_keywords: list[str] | None = None,
+    ) -> Retrieval:
         from lightrag import QueryParam
 
-        param = QueryParam(mode=mode)  # type: ignore[arg-type]
+        hl = [k.strip() for k in (hl_keywords or ()) if k and k.strip()]
+        ll = [k.strip() for k in (ll_keywords or ()) if k and k.strip()]
+        if not hl and not ll:
+            # LightRAG 는 둘 다 비면 50자 미만 질의만 ll=[query] 로 보정하고 그 이상은 거부한다.
+            ll = [question]
+        param = QueryParam(mode=mode, hl_keywords=hl, ll_keywords=ll)  # type: ignore[arg-type]
         if top_k is not None:
             param.top_k = top_k
         return to_retrieval(await self.rag.aquery_data(question, param))

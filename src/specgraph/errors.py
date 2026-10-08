@@ -21,6 +21,14 @@ class IndexingError(SpecGraphError):
     """LightRAG 또는 manifest 반영에 실패했다."""
 
 
+class LlmError(IndexingError):
+    """LLM 호출이 실패했다(``claude -p`` 비정상 종료 · 시간 초과 · 오류 응답 · 비활성 경로 호출)."""
+
+
+class LlmRateLimitedError(LlmError):
+    """구독 사용량 한도(rate limit)에 걸렸다 — 재시도하지 않고 이번 poll 의 나머지를 멈춘다."""
+
+
 class NotFoundError(SpecGraphError):
     """요청한 문서·챕터·화면·정책을 찾지 못했다."""
 

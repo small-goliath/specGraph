@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from specgraph.blocks import BLOCK_SEPARATOR
+from specgraph.errors import LlmRateLimitedError
 from specgraph.indexer.extract import DocumentRef, extract_chapter
 from specgraph.indexer.kg import build_chapter_kg
 from specgraph.lightrag_store import (
@@ -24,10 +25,50 @@ from specgraph.lightrag_store import (
     make_rerank_func,
     to_retrieval,
 )
-from specgraph.llm import LlmCallCounter
+from specgraph.llm import RATE_LIMIT_MARKER, LlmCallCounter, make_disabled_llm_func
 
 DOC = "draft/settlr-admin-prd:prd/settlr-admin-prd.md#5"
 OTHER = "draft/settlr-partner-prd:prd/settlr-partner-prd.md#2"
+LONG_QUESTION = (
+    "정산 정책의 정산 주기와 지급 일정은 어떻게 정해지고 예외는 어떤 경우에 적용되는가"
+    " (50자 이상 질문)"
+)
+
+
+class _QueryStubRag:
+    """retrieve 가 LightRAG 에 넘기는 QueryParam 을 기록하는 최소 스텁."""
+
+    def __init__(self) -> None:
+        self.queries: list[tuple[str, object]] = []
+
+    async def aquery_data(self, question, param):
+        self.queries.append((question, param))
+        return {"status": "success", "data": {"chunks": [], "entities": [], "relationships": []}}
+
+
+async def test_retrieve_passes_keywords_to_query_param():
+    """PPS-350 AC11: hl/ll 키워드가 QueryParam 의 같은 이름 필드로 간다(공백 · 빈 항목은 뺀다)."""
+    rag = _QueryStubRag()
+
+    await LightRagStore(rag).retrieve(
+        "질문", "mix", hl_keywords=["정산 정책", ""], ll_keywords=[" P-14.3 ", "정산 주기"]
+    )
+
+    question, param = rag.queries[0]
+    assert question == "질문" and param.mode == "mix"
+    assert param.hl_keywords == ["정산 정책"]
+    assert param.ll_keywords == ["P-14.3", "정산 주기"]
+
+
+async def test_retrieve_without_keywords_uses_question_as_single_ll_keyword():
+    """PPS-350 AC13: LightRAG 는 50자 이상 질의를 키워드 없이 거부한다 — 어댑터가 ll=[question]."""
+    rag = _QueryStubRag()
+    assert len(LONG_QUESTION) > 50
+
+    await LightRagStore(rag).retrieve(LONG_QUESTION, "mix")
+
+    _, param = rag.queries[0]
+    assert param.hl_keywords == [] and param.ll_keywords == [LONG_QUESTION]
 
 
 def test_insert_body_header_is_unique_per_doc_and_never_spells_the_doc_id():
@@ -76,6 +117,27 @@ class _StubRag:
 
     async def aget_docs_by_ids(self, ids):
         return {i: {"status": "processed"} for i in ids}
+
+
+class _RateLimitedInsertStubRag(_StubRag):
+    """LightRAG 가 llm_model_func 의 예외를 삼키고 doc 을 FAILED + error_msg 로 둔 상태."""
+
+    async def aget_docs_by_ids(self, ids):
+        error = (
+            "Failed to extract entities and relationships: "
+            f"{RATE_LIMIT_MARKER}: claude -p 구독 사용량 한도 초과(exit 1, api_error_status=429)"
+        )
+        return {i: {"status": "failed", "error_msg": error} for i in ids}
+
+
+async def test_insert_failure_with_rate_limit_marker_raises_llm_rate_limited_error():
+    """PPS-350 D5: 삼켜진 한도 초과를 insert_chapter 가 LlmRateLimitedError 로 되살린다."""
+    store = LightRagStore(_RateLimitedInsertStubRag())
+
+    with pytest.raises(LlmRateLimitedError) as exc:
+        await store.insert_chapter(DOC, ["## 5. 정산 정책"])
+
+    assert f"doc_id={DOC}" in str(exc.value) and "status=failed" in str(exc.value)
 
 
 async def test_insert_chapter_sends_exactly_build_insert_body():
@@ -369,7 +431,10 @@ class ByteTokenizer:
         return bytes(tokens).decode("utf-8", "replace")
 
 
-async def _create_store(settings_env, working_dir, **overrides):
+async def _create_store(settings_env, working_dir, *, default_llm=True, **overrides):
+    """``default_llm=False`` 면 ``llm_model_func`` 를 넘기지 않아 ``create`` 가 Settings 로 LLM
+    함수를 만들게 한다(D7 가드 검증용). 그 외에는 ``_fake_llm`` 이 기본이고 ``overrides`` 로
+    덮어쓴다."""
     from lightrag.utils import EmbeddingFunc
 
     from specgraph.settings import load_settings
@@ -381,13 +446,42 @@ async def _create_store(settings_env, working_dir, **overrides):
     settings_env.setenv("LIGHTRAG_DOC_STATUS_STORAGE", "JsonDocStatusStorage")
     kwargs = {
         "workspace": _workspace(working_dir),
-        "llm_model_func": _fake_llm,
         "embedding_func": EmbeddingFunc(embedding_dim=16, func=_fake_embed, model_name="fake"),
         "rerank_model_func": None,
         **overrides,
     }
+    if default_llm:
+        kwargs.setdefault("llm_model_func", _fake_llm)
     counter = kwargs.pop("counter", LlmCallCounter())
     return await LightRagStore.create(load_settings(), counter, **kwargs)
+
+
+async def test_create_with_llm_func_override_does_not_require_llm_model(settings_env, tmp_path):
+    """R3 · AC17: LLM 함수를 밖에서 주면(MCP 의 비활성 스텁) LLM_MODEL 없이도 만들어진다."""
+    settings_env.delenv("LLM_MODEL", raising=False)
+    counter = LlmCallCounter()
+
+    store = await _create_store(
+        settings_env,
+        tmp_path / "rag-no-llm-model",
+        counter=counter,
+        llm_model_func=make_disabled_llm_func(counter),
+        llm_model_name="disabled",
+    )
+    try:
+        assert store.rag.llm_model_name == "disabled"
+    finally:
+        await store.close()
+
+
+async def test_create_without_override_requires_llm_model(settings_env, tmp_path):
+    """R3 · D7: override 가 없으면 create 가 Settings 로 LLM 함수를 만들며 LLM_MODEL 을 요구한다."""
+    from specgraph.errors import ConfigError
+
+    settings_env.delenv("LLM_MODEL", raising=False)
+
+    with pytest.raises(ConfigError, match="LLM_MODEL"):
+        await _create_store(settings_env, tmp_path / "rag-missing-llm-model", default_llm=False)
 
 
 async def _stored_chunks(store, doc_id):
@@ -521,6 +615,55 @@ async def test_real_lightrag_llm_calls_attributed_to_doc_id(settings_env, tmp_pa
 
     assert counter.count_for(DOC) > 0
     assert counter.unattributed == 0
+
+
+async def test_real_lightrag_retrieve_with_keywords_makes_no_llm_calls(settings_env, tmp_path):
+    """PPS-350 AC12 · AC13 · D8: 키워드가 있으면 실제 LightRAG 도 질의에서 LLM 을 부르지 않는다.
+
+    LLM 이 비활성(make_disabled_llm_func)인 새 스토어로 같은 working_dir 을 열어 질의한다 —
+    LLM 이 불리면 LlmError 로 깨진다."""
+    from lightrag.utils import Tokenizer
+
+    from specgraph.llm import make_llm_func
+    from specgraph.settings import load_settings
+
+    class Client:
+        async def chat(self, **_: object) -> dict:
+            return {"message": {"content": ""}}
+
+    counter = LlmCallCounter()
+    working_dir = tmp_path / "rag-query"
+    indexing = await _create_store(
+        settings_env,
+        working_dir,
+        counter=counter,
+        llm_model_func=make_llm_func(load_settings(), counter, client_factory=Client),
+        tokenizer=Tokenizer("char", CharTokenizer()),
+    )
+    try:
+        await indexing.insert_chapter(DOC, ["## 5. 정산 정책\n정산 주기는 D+2 이다."])
+    finally:
+        await indexing.close()
+    calls_after_insert = counter.total
+    assert calls_after_insert > 0
+
+    querying = await _create_store(
+        settings_env,
+        working_dir,
+        counter=counter,
+        llm_model_func=make_disabled_llm_func(counter),
+        llm_model_name="disabled",
+        tokenizer=Tokenizer("char", CharTokenizer()),
+    )
+    try:
+        with_keywords = await querying.retrieve(LONG_QUESTION, "mix", ll_keywords=["정산"])
+        without_keywords = await querying.retrieve(LONG_QUESTION, "mix")
+    finally:
+        await querying.close()
+
+    assert counter.total == calls_after_insert
+    assert {c.doc_id for c in with_keywords.chunks} == {DOC}
+    assert {c.doc_id for c in without_keywords.chunks} == {DOC}
 
 
 ADMIN_DOC = DocumentRef("draft/settlr-admin-prd", "prd/settlr-admin-prd.md")

@@ -25,10 +25,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from specgraph.errors import IndexingError
+from specgraph.errors import IndexingError, LlmRateLimitedError
 from specgraph.kg_model import KgKeys, KgPayload
 from specgraph.lightrag_store import RelationPair, Retrieval, undirected
-from specgraph.llm import LlmCallCounter
+from specgraph.llm import RATE_LIMIT_MARKER, LlmCallCounter
 from specgraph.manifest import ChapterRecord
 
 PROCESSED = "processed"  # LightRAG DocStatus.PROCESSED 값
@@ -44,6 +44,9 @@ class FakeLightRAG:
     llm_calls_per_entity_delete: int = 0
     fail_on: set[str] = field(default_factory=set)
     fail_once: set[str] = field(default_factory=set)
+    # 구독 한도 초과 재현(PPS-350 AC5 · D6): doc_id 에 마커가 들어 있는 삽입은 FAILED 로 두고
+    # LlmRateLimitedError 를 낸다(실제 어댑터가 D5 로 복원한 타입과 같다).
+    rate_limit_on: set[str] = field(default_factory=set)
     fail_kg_once: set[str] = field(default_factory=set)
     fail_merge_once: bool = False
     fail_entity_delete_once: bool = False
@@ -93,6 +96,9 @@ class FakeLightRAG:
                 raise IndexingError(f"fake: doc_id={doc_id} status={self.statuses[doc_id]}")
             return
         self._llm(self.llm_calls_per_insert)
+        if any(marker in doc_id for marker in self.rate_limit_on):
+            self.statuses[doc_id] = FAILED
+            raise LlmRateLimitedError(f"fake: {RATE_LIMIT_MARKER} doc_id={doc_id} status={FAILED}")
         if self._should_fail(doc_id):
             self.statuses[doc_id] = FAILED
             raise IndexingError(f"fake: forced failure doc_id={doc_id} status={FAILED}")
@@ -177,8 +183,17 @@ class FakeLightRAG:
             self.extracted_entities.discard(name)
         self.extracted_entities.add(target)
 
-    async def retrieve(self, question: str, mode: str, top_k: int | None = None) -> Retrieval:
-        self.calls.append(("retrieve", question, mode))
+    async def retrieve(
+        self,
+        question: str,
+        mode: str,
+        top_k: int | None = None,
+        hl_keywords: list[str] | None = None,
+        ll_keywords: list[str] | None = None,
+    ) -> Retrieval:
+        self.calls.append(
+            ("retrieve", question, mode, tuple(hl_keywords or ()), tuple(ll_keywords or ()))
+        )
         return self.retrieval or Retrieval()
 
     def doc_ids(self, prefix: str = "") -> list[str]:

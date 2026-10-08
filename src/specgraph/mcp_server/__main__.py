@@ -1,6 +1,8 @@
 """MCP 서버 stdio 진입점 — ``specgraph-mcp`` / ``python -m specgraph.mcp_server``.
 
 stdout 은 MCP 프로토콜 전용이다. 로그는 stderr 로만 나간다(``configure_logging``).
+LLM 은 쓰지 않는다(PPS-350 AC17): ``LLM_MODEL`` · ``LLM_BINDING_HOST`` 없이 뜨고, LightRAG
+초기화에는 호출되면 ``LlmError`` 를 내는 비활성 스텁(``make_disabled_llm_func``)을 넘긴다(D8).
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ async def real_services() -> Services:
     서버 종료 때(``Services.close``) 닫힌다.
     """
     from specgraph.lightrag_store import LightRagStore
-    from specgraph.llm import LlmCallCounter, make_llm_func
+    from specgraph.llm import LlmCallCounter, make_disabled_llm_func
     from specgraph.manifest import PostgresManifest
     from specgraph.mcp_server.lookup import LookupService
     from specgraph.mcp_server.query_service import QueryService
@@ -27,7 +29,12 @@ async def real_services() -> Services:
     counter = LlmCallCounter()
     manifest = await PostgresManifest.create(settings.postgres_dsn())
     try:
-        store = await LightRagStore.create(settings, counter)
+        store = await LightRagStore.create(
+            settings,
+            counter,
+            llm_model_func=make_disabled_llm_func(counter),
+            llm_model_name="disabled",
+        )
     except BaseException:
         await manifest.close()
         raise
@@ -39,7 +46,7 @@ async def real_services() -> Services:
             await manifest.close()
 
     return Services(
-        query=QueryService(store, manifest, make_llm_func(settings, counter)),
+        query=QueryService(store, manifest),
         lookup=LookupService(manifest),
         close=close,
     )

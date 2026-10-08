@@ -4,7 +4,10 @@ product-docs 저장소의 `draft/*` 브랜치에 있는 기획 문서(PRD · UI/
 **챕터 단위로 증분 인덱싱**해 지식 그래프(GraphRAG)로 만들고, **MCP 도구**로 Claude Code 에서 조회하게 하는 PoC 다.
 
 - 모든 응답에 출처 `doc_id` 와 `commit_sha` 가 붙는다.
-- LLM · 임베딩 · 리랭커 · 벡터/그래프 데이터는 **전부 로컬**에서 돈다(외부 LLM API 호출 없음).
+- 기본은 LLM · 임베딩 · 리랭커 · 벡터/그래프 데이터 **전부 로컬**(외부 LLM API 호출 없음).
+  `LLM_BINDING=claude_code` 면 **추출 LLM 만** 구독 Claude Code 의 `claude -p` 를 쓴다 — API 키 ·
+  과금 경로 없음, 구독 로그인된 사용자 PC 에서 호스트 실행 전용(PPS-350).
+- MCP `query` 는 LLM 으로 답하지 않고 근거(청크 · 엔티티 · 관계)만 돌려준다. 질의 경로의 LLM 호출은 0 건이다.
 - 인덱싱은 변경된 챕터만 다시 처리한다. 바뀌지 않은 챕터는 LLM 을 호출하지 않는다.
 
 ## 구성
@@ -16,6 +19,7 @@ product-docs (git, draft/*)
   indexer ──────────► LightRAG ──► PostgreSQL (KV · 벡터 · 그래프 · doc status · manifest)
   (폴링 · 챕터 증분)      ▲  ▲
                          │  └─ Ollama (LLM Qwen3-8B · 임베딩 BGE-M3)
+                         │       └─ 또는 LLM_BINDING=claude_code: 호스트의 `claude -p`(구독, 추출 전용)
                          └──── rerank (bge-reranker-v2-m3)
         ▲
         │ stdio
@@ -27,7 +31,7 @@ product-docs (git, draft/*)
 | `specgraph-indexer` | `draft/*` 브랜치를 폴링하고 챕터 단위로 LightRAG 에 넣는다. 쓰기 주체는 이 프로세스 하나다. |
 | `specgraph-mcp` | FastMCP(stdio) 서버. 다섯 도구로 조회한다. 컨테이너가 아니라 호스트에서 실행한다. |
 | PostgreSQL | pgvector + Apache AGE. LightRAG 스토리지 전부와 `specgraph` manifest 스키마를 담는다. |
-| Ollama / rerank | 로컬 LLM · 임베딩 / 리랭커 |
+| Ollama / rerank | 로컬 LLM · 임베딩 / 리랭커. 추출 LLM 은 `LLM_BINDING=claude_code` 로 호스트 `claude -p` 로 바꿀 수 있다(임베딩 · 리랭커는 로컬 유지) |
 | LightRAG 서버 | WebUI · REST **질의 전용**(포트 9621). 문서 업로드 등 쓰기 API 는 쓰지 않는다. |
 
 ### doc_id
@@ -85,23 +89,24 @@ GitHub **Fine-grained personal access token** 을 쓴다.
 ```bash
 set -a; source deploy/.env; set +a
 export POSTGRES_HOST=localhost \
-       LLM_BINDING_HOST=http://localhost:11434 \
        EMBEDDING_BINDING_HOST=http://localhost:11434 \
        RERANK_BINDING_HOST=http://localhost:7997/rerank
 claude        # 저장소 루트에서 실행 → .mcp.json 승인 → /mcp 에서 specgraph connected 확인
 ```
 
+MCP 서버는 LLM 을 쓰지 않으므로 `LLM_MODEL` · `LLM_BINDING_HOST` 가 필요 없다(`.mcp.json` 에도 없다).
+
 ### 도구
 
 | 도구 | 인자 | 설명 |
 |---|---|---|
-| `query` | `question`, `mode`(`local` `global` `hybrid` `naive` `mix`, 기본 `mix`), `branch`(선택) | 한국어 질문에 GraphRAG 로 답하고 출처를 반환한다. |
+| `query` | `question`, `mode`(`local` `global` `hybrid` `naive` `mix`, 기본 `mix`), `branch`(선택), `hl_keywords`(선택, 관계 검색용 상위 키워드), `ll_keywords`(선택, 엔티티 검색용 하위 키워드) | 근거 반환 전용 — 청크 본문 · 엔티티 · 관계를 각각 `doc_id` · `commit_sha` 와 함께 돌려주고 답변은 만들지 않는다. 키워드는 호출자(Claude Code)가 뽑아 넘기며, 둘 다 비면 질문 전체를 하위 키워드로 쓴다. 근거가 없으면 빈 목록 + `no_evidence: true`. |
 | `get_chapter` | `doc`, `section` | 챕터 원문. `doc` 은 `<branch>:<path>`, 브랜치명, 짧은 이름(`admin-prd`) 모두 가능하고 `section` 은 `5`, `§5`, `5.2`, `preamble` 형식이다. |
 | `find_screen` | `id` | 화면 ID(예: `ADM-03`, `PTN-P-04`)가 정의된 챕터 원문. |
 | `find_policy` | `id` | 정책 ID(예: `P-14.3`, `U-2`)가 정의된 챕터 원문. |
 | `list_docs` | — | 인덱싱된 브랜치 · 문서 · 챕터 목록. |
 
-`get_chapter` · `find_screen` · `find_policy` · `list_docs` 는 manifest 를 직접 조회하며 LLM 을 쓰지 않는다.
+다섯 도구 모두 LLM 을 쓰지 않는다. `query` 는 LightRAG 검색만 하고, 나머지는 manifest 를 직접 조회한다.
 
 ### 사용 예
 
@@ -118,8 +123,8 @@ Claude Code 에서 자연어로 요청하면 도구가 호출된다.
 
 - 처음 인덱싱 중이거나 삽입에 실패한 챕터는 조회 도구에 나오지 않는다.
 - 재삽입 중이거나 재삽입에 실패한 챕터는 직전에 성공한 내용으로 보인다.
-- `query` 의 `sources` 는 인덱싱이 끝난 챕터만 담지만, 답변 본문에는 숨겨진 챕터의 엔티티 · 관계 설명이
-  섞일 수 있다(알려진 한계).
+- `query` 는 숨겨진 챕터의 청크를 빼고, 엔티티 · 관계에는 보이는 출처만 붙인다(보이는 출처가 하나도
+  없으면 그 항목을 뺀다). 참조 확장(REFERS_TO 한 단계)으로 덧붙인 챕터 본문은 `expanded: true` 청크다.
 
 ## 개발
 
@@ -173,11 +178,13 @@ docs/            PPS-346-runbook.md (실행 · 수동 검증 · 알려진 제약
 | `SPECGRAPH_INCLUDE_DIRS` | `prd,ui-ux-spec,tech-spec,qa` | 대상 디렉터리 이름만 나열한다. 인덱싱 대상은 `<프로젝트>/<대상 디렉터리>/…` 아래의 `.md` 이며 프로젝트 이름(예: `settlr`)은 나열하지 않는다 |
 | `SPECGRAPH_POLL_INTERVAL_SECONDS` | `120` | 폴링 주기 |
 | `SPECGRAPH_LOG_FORMAT` | `kv` | `json` 이면 JSON 로그(stderr) |
-| `LLM_MODEL` | `qwen3:8b` | LLM |
+| `LLM_BINDING` | `ollama` | 추출 LLM 경로. `claude_code` 면 구독 Claude Code 의 `claude -p` 를 서브프로세스로 쓴다(구독 로그인된 PC 호스트 실행 전용, 컨테이너는 compose 가 `ollama` 고정). 허용값 밖이면 `ConfigError` |
+| `LLM_MODEL` | `qwen3:8b` | 추출 LLM. `claude_code` 면 `claude --model` 값(별칭 · ID) — `.env` 의 Ollama 모델명을 셸에서 덮어쓴다. 인덱서만 요구하고 MCP 는 쓰지 않는다 |
 | `EMBEDDING_MODEL` | `bge-m3` | 임베딩(차원 1024) |
 | `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | 리랭커 |
-| `LLM_TIMEOUT` | `.env.example` 1800(코드 기본 600) | LLM 호출 하나의 타임아웃(초). HTTP 읽기 한도는 이 값, LightRAG 워커 한도는 2배 |
-| `OLLAMA_LLM_NUM_CTX` | `16384` | Ollama 요청의 `num_ctx`(토큰). 서버 기본 4096 은 추출 출력이 길면 지시문이 잘린다 |
+| `LLM_TIMEOUT` | `.env.example` 1800(코드 기본 600) | LLM 호출 하나의 타임아웃(초). ollama: HTTP 읽기 한도는 이 값, LightRAG 워커 한도는 2배. claude_code: `claude -p` 1회 한도(넘기면 프로세스 그룹 종료 후 그 챕터 실패) |
+| `OLLAMA_LLM_NUM_CTX` | `16384` | Ollama 요청의 `num_ctx`(토큰, ollama 바인딩에서만). 서버 기본 4096 은 추출 출력이 길면 지시문이 잘린다 |
+| `MAX_ASYNC` | `2` | LightRAG 동시 LLM 호출 수. claude_code 면 동시에 뜨는 `claude` 프로세스 수 |
 | `POSTGRES_PASSWORD` | — | 필수, 기본값 없음 |
 
 임베딩 모델을 바꾸면 벡터 재색인이 필요하다(`down -v` 후 재기동).
@@ -192,6 +199,10 @@ docs/            PPS-346-runbook.md (실행 · 수동 검증 · 알려진 제약
 - LightRAG 서버(9621)는 인증이 없다. 모든 포트는 `127.0.0.1` 에만 바인딩한다. 쓰기 API 는 쓰지 않는다.
   indexer 와 같은 PostgreSQL workspace 를 공유하므로 쓰는 순간 manifest 와 어긋난다.
 - 호스트 실행(MCP · `--once`)은 첫 실행에 tiktoken 토크나이저 파일을 내려받는다(LLM API 호출은 아니다).
+- `LLM_BINDING=claude_code` 는 구독 로그인된 사용자 PC 에서 **일반 터미널**로 호스트 실행할 때만 쓴다.
+  컨테이너 indexer · lightrag 에서는 쓸 수 없고(compose 가 `ollama` 고정), 공용 서버에 올리지 않는다.
+  구독 사용량 한도에 걸리면 재시도하지 않고 `event=llm_rate_limited` 를 남긴 뒤 그 poll 의 나머지
+  브랜치를 건너뛴다(다음 poll 재시도). 초기 인덱싱 물량이 한도 안에 드는지는 실측 전이다(runbook §9).
 - 종료 신호(SIGTERM · SIGINT)를 받으면 진행 중인 처리를 취소하고 종료한다. 취소된 챕터는
   `chapter_sync` 에 `*_failed`(`insert_failed` · `reinsert_failed` · `delete_failed`)로 남고,
   브랜치 HEAD 는 갱신되지 않아 다음 실행에서 다시 처리된다. `poll_cancelled` 로그가 찍힌다.

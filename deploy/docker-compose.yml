@@ -14,6 +14,8 @@ name: specgraph
 x-ollama-image: &ollama-image ${OLLAMA_IMAGE}
 
 x-model-env: &model-env
+  # 컨테이너(lightrag 서버 · indexer)는 .env 의 LLM_BINDING 과 무관하게 ollama 고정이다(PPS-350 D12).
+  # claude_code 는 구독 로그인이 있는 호스트에서만 동작한다 — 컨테이너로 새면 기동 실패한다.
   LLM_BINDING: ollama
   LLM_MODEL: ${LLM_MODEL}
   LLM_BINDING_HOST: ${LLM_BINDING_HOST}

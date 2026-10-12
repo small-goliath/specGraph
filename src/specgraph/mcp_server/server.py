@@ -1,7 +1,9 @@
-"""FastMCP 서버 — 다섯 도구 (AC18 · AC19 · AC17).
+"""FastMCP 서버 — 다섯 도구 (AC18 · AC19 · AC17, PPS-350 AC11 · AC14).
 
-``query(question, mode, branch)`` · ``get_chapter(doc, section)`` · ``find_screen(id)`` ·
-``find_policy(id)`` · ``list_docs()`` (도구명 · 인자명은 티켓 고정).
+``query(question, mode, branch, hl_keywords, ll_keywords)`` · ``get_chapter(doc, section)`` ·
+``find_screen(id)`` · ``find_policy(id)`` · ``list_docs()`` (도구명 · 인자명은 티켓 고정).
+``query`` 는 답변을 만들지 않고 근거(청크 · 엔티티 · 관계, 각각 doc_id · commit_sha)만 돌려준다 —
+키워드는 호출자(Claude Code)가 뽑아 넘기고, 이 서버는 LLM 을 쓰지 않는다.
 의존성(PostgreSQL manifest · LightRAG)은 첫 도구 호출 때 한 번 만들고, 서버가 끝날 때(lifespan)
 닫는다. 모든 도메인 예외(``SpecGraphError`` — 초기화 실패 포함)는 도구 오류 응답으로 바꾼다.
 """
@@ -28,7 +30,10 @@ QueryMode = Literal["local", "global", "hybrid", "naive", "mix"]
 
 INSTRUCTIONS = (
     "product-docs 의 draft/* 브랜치 기획 문서(PRD · UI/UX spec · tech-spec · QA) 지식 그래프. "
-    "doc_id 형식은 <branch>:<path>#<§번호>. 모든 응답에 doc_id 와 commit_sha 출처가 있다."
+    "doc_id 형식은 <branch>:<path>#<§번호>. 모든 응답에 doc_id 와 commit_sha 출처가 있다. "
+    "query 는 답변이 아니라 근거(청크 · 엔티티 · 관계)만 돌려준다 — 호출자가 질문에서 "
+    "hl_keywords(주제 · 관계 수준)와 ll_keywords(구체 엔티티 · 화면/정책 ID)를 뽑아 넘기고, "
+    "돌아온 근거로 답을 만들며 doc_id 를 인용한다."
 )
 
 
@@ -90,9 +95,33 @@ def build_server(services: ServicesFactory) -> FastMCP:
             str | None,
             Field(description="브랜치 한정(예: draft/<프로젝트>-<문서명>). 없으면 전체 브랜치"),
         ] = None,
+        hl_keywords: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "관계(global/hybrid/mix) 검색용 상위 키워드 — 주제 · 개념 수준"
+                    "(예: '정산 정책', '지급 일정')"
+                )
+            ),
+        ] = None,
+        ll_keywords: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "엔티티(local/hybrid/mix) 검색용 하위 키워드 — 구체 엔티티 · 화면/정책 ID"
+                    "(예: 'P-14.3', 'ADM-03'). 둘 다 비면 질문 전체를 하위 키워드로 쓴다"
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        """지식 그래프에 질문한다. 답변과 출처(doc_id, commit_sha)를 반환한다."""
-        result = await _call(lazy, lambda s: s.query.query(question, mode, branch))
+        """지식 그래프에서 근거를 검색한다(LLM 호출 없음).
+
+        청크 본문 · 엔티티 · 관계를 각각 doc_id · commit_sha 출처와 함께 반환하고, 근거가 없으면
+        빈 목록과 no_evidence=true 를 돌려준다. 답변은 호출자가 이 근거로 만든다.
+        """
+        result = await _call(
+            lazy, lambda s: s.query.query(question, mode, branch, hl_keywords, ll_keywords)
+        )
         return result.to_dict()
 
     @mcp.tool

@@ -48,6 +48,7 @@ specGraph 애플리케이션 코드(`src/`, `tests/`, `deploy/`)의 규칙이다
 - **비동기 · LightRAG:** asyncio 전면, LightRAG 는 라이브러리(`lightrag-hku`)로 직접 사용 — PPS-346 계획에서 확정(Q10)
 - **배포 파일:** `deploy/` 에 집중(`docker-compose.yml`, `app.Dockerfile`, `postgres/`, `.env.example`). 포트는 `127.0.0.1` 에만 바인딩 — PPS-346 계획에서 확정(Q11)
 - **doc_id:** `<branch>:<path>#<§번호>`, 챕터 = 문서의 최상위 번호 헤딩, 머리말은 `#preamble` — PPS-346 계획에서 확정(D5)
+- **LLM 바인딩 · 서브프로세스:** 외부 LLM 은 `LLM_BINDING`(`ollama` · `claude_code`)으로 고르고 구현은 `llm.py` 한 곳이다. 서브프로세스는 `create_subprocess_exec(start_new_session=True)` + `wait_for(timeout)` + 그룹 kill + 도메인 예외 + `CancelledError` 정리 구조를 따른다(`git_source.py` · `llm.py`). 자식 env 에서 API 과금 변수(`ANTHROPIC_API_KEY` 등)를 제거한다. 테스트는 콜러블 runner 주입이 기본, 실제 프로세스 동작(cwd · env · 타임아웃 · 취소)만 PATH 가짜 스크립트 — PPS-350 계획에서 확정(CQ1~CQ5 · D2)
 
 ## specGraph 실행
 

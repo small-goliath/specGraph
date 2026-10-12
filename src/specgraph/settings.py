@@ -5,6 +5,11 @@
 LightRAG 규약 이름 그대로 읽는다. 그래서 ``.env`` 하나가 서버·인덱서·MCP 를 모두 구동한다.
 
 모델명은 기본값이 없다(코드에 모델 리터럴을 두지 않는다 — AC2).
+
+``LLM_BINDING``(``ollama`` · ``claude_code``, PPS-350)으로 추출 LLM 경로를 고른다. ``LLM_MODEL`` 은
+선택값이다(빈 문자열은 None) — MCP 서버는 LLM 없이 뜨고, 인덱서는 ``make_llm_func`` 가 두
+바인딩 모두에서 ``ConfigError`` 로 요구한다(D7). ``LLM_BINDING_HOST`` · ``OLLAMA_LLM_NUM_CTX`` 는
+ollama 바인딩에서만 읽는다.
 """
 
 from __future__ import annotations
@@ -48,7 +53,10 @@ class Settings(BaseSettings):
     max_block_chars: int = Field(default=1000, gt=0, validation_alias="SPECGRAPH_MAX_BLOCK_CHARS")
 
     # --- 모델 · 엔드포인트 (LightRAG 규약 이름) ---
-    llm_model: str = Field(validation_alias="LLM_MODEL", min_length=1)
+    llm_binding: Literal["ollama", "claude_code"] = Field(
+        default="ollama", validation_alias="LLM_BINDING"
+    )
+    llm_model: str | None = Field(default=None, validation_alias="LLM_MODEL")
     llm_binding_host: str = Field(
         default="http://localhost:11434", validation_alias="LLM_BINDING_HOST"
     )
@@ -87,6 +95,14 @@ class Settings(BaseSettings):
     doc_status_storage: str = Field(
         default="PGDocStatusStorage", validation_alias="LIGHTRAG_DOC_STATUS_STORAGE"
     )
+
+    @field_validator("llm_model", mode="before")
+    @classmethod
+    def _empty_model_is_none(cls, value: Any) -> Any:
+        """compose 가 기본값 없는 참조(``${LLM_MODEL}``)를 빈 문자열로 넘길 수 있다."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("include_dirs", mode="before")
     @classmethod

@@ -5,6 +5,7 @@ import re
 import pytest
 
 from fakes import FakeLightRAG, InMemoryManifest
+from specgraph.errors import LlmError
 from specgraph.indexer.git_source import GitSource
 from specgraph.indexer.service import IndexerService
 from specgraph.llm import LlmCallCounter
@@ -262,6 +263,85 @@ async def test_branch_failure_isolated_and_retried(env, caplog):
 
     assert second.indexed == [PARTNER_BRANCH]
     assert manifest.heads[PARTNER_BRANCH] == remote.shas[PARTNER_BRANCH]
+
+
+async def test_rate_limited_branch_stops_remaining_branches_in_same_poll_and_retries_next_poll(
+    env, caplog
+):
+    """PPS-350 AC5 · D6: 한도는 계정 단위다 — 그 브랜치는 격리(HEAD 미갱신)하고 같은 poll 의 나머지
+    브랜치는 건너뛴다(event=poll_rate_limited skipped=N). 다음 poll 은 평소처럼 재시도한다."""
+    remote, service, rag, manifest, _ = env
+    rag.rate_limit_on.add(ADMIN_BRANCH)
+    caplog.set_level(logging.INFO)
+
+    first = await service.poll_once()
+
+    assert list(first.failed) == [ADMIN_BRANCH]
+    assert first.indexed == []
+    assert first.rate_limited is True
+    assert not any(c[0] == "insert" and PARTNER_BRANCH in c[1] for c in rag.calls)
+    assert ADMIN_BRANCH not in manifest.heads and PARTNER_BRANCH not in manifest.heads
+    assert _events(caplog, "branch_failed")
+    rate_limited = _events(caplog, "poll_rate_limited")
+    assert len(rate_limited) == 1 and "skipped=1" in rate_limited[0]
+
+    rag.rate_limit_on.clear()
+    second = await service.poll_once()
+
+    assert second.rate_limited is False
+    assert sorted(second.indexed) == [ADMIN_BRANCH, PARTNER_BRANCH]
+    assert manifest.heads == {
+        ADMIN_BRANCH: remote.shas[ADMIN_BRANCH],
+        PARTNER_BRANCH: remote.shas[PARTNER_BRANCH],
+    }
+
+
+async def test_rate_limited_poll_skips_glossary_merge_and_retries_next_poll(env, docs):
+    """R5 · D6: 한도 초과 poll 은 용어 병합(LLM 호출 가능)도 건너뛰고 다음 poll 에서 재시도한다."""
+    remote, service, rag, _, _ = env
+    await service.poll_once()  # 정상 인덱싱 — "0. 용어" 사전이 manifest 에 올라간다
+    rag.extracted_entities.update({"정산", "Settlement"})
+    remote.commit(ADMIN_BRANCH, {ADMIN_PATH: docs["admin"] + "\n\n변경된 문장.\n"})
+    rag.rate_limit_on.add(ADMIN_BRANCH)
+    merges_before = len([c for c in rag.calls if c[0] == "merge"])
+
+    limited = await service.poll_once()
+
+    assert limited.rate_limited is True
+    assert len([c for c in rag.calls if c[0] == "merge"]) == merges_before
+    assert service._glossary_pending is True
+
+    rag.rate_limit_on.clear()
+    recovered = await service.poll_once()
+
+    assert recovered.rate_limited is False
+    assert rag.merges[-1] == (["Settlement"], "정산")
+    assert service._glossary_pending is False
+
+
+async def test_llm_error_in_branch_is_isolated_and_head_not_updated(git_remote, tmp_path, docs):
+    """PPS-350 AC4: claude -p 실패(LlmError)도 다른 IndexingError 처럼 브랜치 단위로 격리된다."""
+
+    class LlmFailingRag(FakeLightRAG):
+        async def insert_chapter(self, doc_id, blocks):
+            if PARTNER_BRANCH in doc_id:
+                raise LlmError("claude -p 실패(exit 1): boom")
+            await super().insert_chapter(doc_id, blocks)
+
+    remote = git_remote()
+    remote.commit(ADMIN_BRANCH, {ADMIN_PATH: docs["admin"]})
+    remote.commit(PARTNER_BRANCH, {PARTNER_PATH: docs["partner"]})
+    counter = LlmCallCounter()
+    manifest = InMemoryManifest()
+    service = _service(remote, tmp_path, LlmFailingRag(counter=counter), manifest, counter)
+
+    result = await service.poll_once()
+
+    assert result.indexed == [ADMIN_BRANCH]
+    assert list(result.failed) == [PARTNER_BRANCH] and "boom" in result.failed[PARTNER_BRANCH]
+    assert result.rate_limited is False
+    assert PARTNER_BRANCH not in manifest.heads
+    assert manifest.heads[ADMIN_BRANCH] == remote.shas[ADMIN_BRANCH]
 
 
 def _service(remote, tmp_path, rag, manifest, counter):

@@ -98,7 +98,16 @@ export POSTGRES_HOST=localhost LLM_BINDING_HOST=http://localhost:11434 \
        EMBEDDING_BINDING_HOST=http://localhost:11434 \
        RERANK_BINDING_HOST=http://localhost:7997/rerank
 uv run specgraph-indexer --once       # 1회 동기화 후 종료(AC12 측정용). 종료코드 0=성공, 1=브랜치 실패
-uv run specgraph-mcp                  # MCP stdio 서버(보통은 Claude Code 가 실행)
+uv run specgraph-mcp                  # MCP stdio 서버(보통은 Claude Code 가 실행). LLM 설정 불필요
+```
+
+추출 LLM 을 구독 Claude Code 로 바꾸려면(PPS-350) `.env` 는 그대로 두고 **셸에서만** 덮어쓴다 —
+`LLM_MODEL` 도 Claude Code 모델 별칭/ID 로 바꿔야 한다(`.env` 의 `qwen3:8b` 는 컨테이너용).
+`LLM_BINDING_HOST` 는 이 경로에서 무시된다. 절차 · 실측은 §9.
+
+```bash
+export LLM_BINDING=claude_code LLM_MODEL=<Claude Code 모델 별칭 또는 ID>
+uv run specgraph-indexer --once       # 일반 터미널에서(Claude Code 세션 안에서 실행하지 않는다)
 ```
 
 compose 의 indexer 가 떠 있으면 `--once` 는 advisory lock 때문에 종료코드 2 로 끝난다.
@@ -107,14 +116,15 @@ compose 의 indexer 가 떠 있으면 `--once` 는 advisory lock 때문에 종�
 ## 4. Claude Code 등록 (AC20)
 
 저장소 루트의 `.mcp.json` 에 `specgraph` 가 등록돼 있다. 값은 셸 환경변수에서 읽는다.
-모델명(`LLM_MODEL` · `EMBEDDING_MODEL` · `RERANK_MODEL`)과 `POSTGRES_PASSWORD` 는 `.mcp.json` 에
+모델명(`EMBEDDING_MODEL` · `RERANK_MODEL`)과 `POSTGRES_PASSWORD` 는 `.mcp.json` 에
 기본값이 없다 — 모델명의 출처는 `deploy/.env` 하나다. 엔드포인트 · 접속 주소만 로컬 기본값이 있다.
+MCP 서버는 LLM 을 쓰지 않으므로 `LLM_MODEL` · `LLM_BINDING_HOST` 는 넘기지 않는다(PPS-350 AC17).
 `deploy/.env` 의 엔드포인트는 컨테이너 이름(`ollama`, `rerank`, `postgres`)이므로 호스트 주소로
 덮어쓴 뒤 Claude Code 를 실행한다.
 
 ```bash
 set -a; source deploy/.env; set +a    # 모델명 · POSTGRES_PASSWORD 등
-export POSTGRES_HOST=localhost LLM_BINDING_HOST=http://localhost:11434 \
+export POSTGRES_HOST=localhost \
        EMBEDDING_BINDING_HOST=http://localhost:11434 \
        RERANK_BINDING_HOST=http://localhost:7997/rerank
 claude                                 # 저장소 루트에서 실행 → .mcp.json 승인
@@ -134,7 +144,10 @@ claude                                 # 저장소 루트에서 실행 → .mcp.
 | `extract` | doc_id · screens · policies · section_refs · cross_doc_refs · dangling_refs | M7 추출 통계. dangling_refs 는 아직 없는 챕터로의 참조(엣지 미생성) |
 | `sync_done` | branch · head · elapsed_s · llm_calls_total · inserted · reinserted · deleted · skipped | AC12 측정. llm_calls_total = 그 브랜치 chapter_sync llm_calls 합 |
 | `branch_removed` | branch · chapters | AC6 |
-| `branch_failed` | branch · error_type · error (예상 못 한 예외는 traceback `exc=`) | 실패 격리 — 다음 주기에 재시도 |
+| `branch_failed` | branch · error_type · error (예상 못 한 예외는 traceback `exc=`) | 실패 격리 — 다음 주기에 재시도. `claude -p` 실패 · 시간 초과는 `error_type=LlmError`, 한도 초과는 `LlmRateLimitedError` |
+| `llm_rate_limited` | binding · model · exit_code · api_error_status · subtype | PPS-350 AC5 — `claude -p` 가 구독 사용량 한도 응답을 돌려줬다. 재시도하지 않는다(세션 ID · 응답 본문은 남기지 않는다) |
+| `poll_rate_limited` | branch · skipped · error | PPS-350 D6 — 한도 초과 브랜치를 격리한 뒤 같은 poll 의 나머지 `skipped` 개 브랜치를 건너뛰었다. 다음 poll 에 평소처럼 재시도 |
+| `llm_exec` (DEBUG) | binding · model · prompt_bytes · history | `claude -p` 1회 실행. 프롬프트 · 결과는 남기지 않는다 |
 | `poll_crashed` | error_type · error · traceback | 폴링 자체가 예상 못 한 예외로 끝남 — 다음 주기에 재시도 |
 | `file_skipped` | branch · path · error | UTF-8 이 아닌 .md — 그 파일만 건너뛴다(그 파일의 기존 챕터는 지워진다) |
 | `cross_ref_unresolved` | doc_id · name · kind · section | 문서 간 참조 해석 실패(엣지 미생성). 한글 이름 참조("어드민 PRD §5")는 브랜치 · 파일명과 대조할 수 없어 여기에 남는다 |
@@ -149,7 +162,7 @@ claude                                 # 저장소 루트에서 실행 → .mcp.
 |---|---|---|---|
 | M1 | AC1 | §2 의 `up -d` **1회** → `docker compose ps` · `docker stats --no-stream` · `docker compose exec postgres psql -U $POSTGRES_USER -d $POSTGRES_DATABASE -c '\dx'` · `curl -s localhost:9621/health` · `docker compose ps -a ollama-pull` | 상시 서비스(postgres · ollama · rerank · lightrag) `healthy`, indexer `running`, ollama-pull `Exited (0)`, `\dx` 에 `vector` · `age`, health 에 PG 스토리지 4종 · `Korean`, 메모리 합계 기록(OOM 없음). 최초 모델 다운로드 시간은 별도 기록(판정 제외) |
 | M2 | AC12 | `git clone --mirror <product-docs> /tmp/pd.git` → `SPECGRAPH_REPO_URL=file:///tmp/pd.git` 로 `uv run specgraph-indexer --once`(초기 전체) → 미러에서 한 draft 브랜치의 챕터 ≤3개 수정 커밋 → 다시 `--once` (호스트 네이티브 Ollama) | `event=sync_done ... elapsed_s ≤ 600`, `reinserted+inserted+deleted ≤ 3`. 컨테이너 Ollama 수치도 참고 기록. **원격(product-docs)에는 쓰지 않는다** |
-| M3 | AC15 | 실문서 인덱싱 후 MCP `query("파트너 정산 정책의 근거가 되는 Admin PRD 조항은?", "mix", null)` 등 한국어 질문 2건 | 각 응답 `sources` 에 `draft/settlr-partner-prd:` · `draft/settlr-admin-prd:` 접두어 doc_id 가 모두 있고, 모든 source 에 `commit_sha` |
+| M3 | AC15 | 실문서 인덱싱 후 MCP `query("파트너 정산 정책의 근거가 되는 Admin PRD 조항은?", "mix", null, hl_keywords=["정산 정책"], ll_keywords=["정산 주기", "P-14.3"])` 등 한국어 질문 2건(키워드는 호출자가 뽑는다) | 각 응답 `sources` 에 `draft/settlr-partner-prd:` · `draft/settlr-admin-prd:` 접두어 doc_id 가 모두 있고, 모든 source · chunk · entity · relation 에 `commit_sha`. 응답에 `answer` 가 없고 `no_evidence=false`. MCP 프로세스 로그에 LLM 호출이 없다(PPS-350 AC12 · AC14) |
 | M4 | AC20 | §4 → 다섯 도구를 각각 1회 호출 | 5개 모두 오류 없이 응답, `find_screen("ADM-03")` 이 원문 + doc_id 반환 |
 | M5 | AC3 | LightRAG WebUI(`http://localhost:9621`) 또는 SQL 로 LLM 추출 엔티티 20개 표본 확인 | 설명 · 요약이 한국어(고유명사 · ID 제외) 20개 중 18개 이상 |
 | M6 | AC9 | M2 의 두 번째 실행 로그 | 미변경 챕터 전부 `action=skip llm_calls=0`, `llm_calls>0` 은 수정 챕터 doc_id 에만 |
@@ -240,16 +253,19 @@ N8 에서 모델 카드 원문으로 재확인한다.
   시작 기록을 남긴다. 삽입이 중간에 실패하면 다음 주기에 그 챕터를 다시 넣고(이전 시도의 LightRAG
   문서 · custom KG 관계를 지운 뒤), 브랜치가 지워지면 함께 정리된다. MCP 노출 규칙(PPS-347):
   **처음 삽입하는 챕터의 시작 기록은 MCP 에 숨긴다**(`list_docs` · `get_chapter` · `find_screen` ·
-  `find_policy` 에 나오지 않고 `query` 의 `sources` 에도 없다). **재삽입 중인 챕터는 직전 완료본**
-  (본문 · SHA · 화면/정책)이 계속 보인다. 다만 `query` 의 LightRAG 프롬프트 본문(`answer`)에는
-  숨긴 챕터의 근거가 섞일 수 있다(`sources` 목록에는 없다).
+  `find_policy` 에 나오지 않고 `query` 의 `sources` · `chunks` 에도 없다). **재삽입 중인 챕터는 직전
+  완료본**(본문 · SHA · 화면/정책)이 계속 보인다. `query` 의 엔티티 · 관계에는 보이는 출처만 붙고
+  보이는 출처가 없는 항목은 빠진다(PPS-350 AC15 — 이전의 "답변 본문에 섞일 수 있다" 한계는 답변
+  생성 자체가 없어져 사라졌다).
 - **공유 노드(SCREEN · POLICY · DOCUMENT):** custom KG 를 넣을 때 이미 있는 노드의 설명 · 출처
   (LLM 이 추출한 것 포함)를 지우지 않고 합친다. 챕터를 지우거나 바꾸면 그 챕터의 출처만 뺀다.
   없는 § 를 가리키는 참조는 엣지를 만들지 않고(`dangling_refs`), 그 챕터가 생기면 재해석으로 잇는다.
 - **삭제 시 재구성 LLM 호출:** 변경 챕터를 지울 때 LightRAG 가 공유 엔티티 요약을 다시 만들 수 있다.
   그 호출은 변경 챕터 doc_id 로 귀속되어 로그에 남는다(무변경 챕터는 LightRAG 무접촉).
-- **LLM 타임아웃 두 경로(PPS-349):** `LLM_TIMEOUT=T` 가 ① specgraph 의 Ollama HTTP 읽기 한도(T)와
-  ② LightRAG 워커 한도(2T, LightRAG 이 import 시점에 환경변수 `LLM_TIMEOUT` 에서 읽는다)를 정한다.
+- **LLM 타임아웃 세 경로(PPS-349 · PPS-350):** `LLM_TIMEOUT=T` 가 ① specgraph 의 Ollama HTTP 읽기 한도(T),
+  ② LightRAG 워커 한도(2T, LightRAG 이 import 시점에 환경변수 `LLM_TIMEOUT` 에서 읽는다),
+  ③ `claude_code` 바인딩의 `claude -p` 프로세스 1회 한도(T — 넘기면 프로세스 그룹 SIGKILL 후
+  `LlmError`, 그 챕터는 FAILED → 브랜치 실패 격리)를 정한다.
   compose 가 `LLM_TIMEOUT` 을 컨테이너로 전달하므로 둘은 같은 값에서 나온다(기본 `.env.example` 1800
   → 워커 3,600초). 멈춘 호출은 T 초 뒤에야 드러난다. 확인: 추출이 시작될 때 LightRAG 이 찍는
   `extract LLM func … Timeouts` 로그의 `Func: <T>s` — **기동 직후가 아니라 추출 시작 시 찍힌다**
@@ -285,3 +301,90 @@ N8 에서 모델 카드 원문으로 재확인한다.
   보고한다(조건 완화는 사용자 결정).
 - **custom KG 쓰기는 LightRAG 문서 단위 복구 보장 밖이다**(LightRAG `ainsert_custom_kg` 경고). 장애 시
   `down -v` 후 재인덱싱이 가장 단순한 복구다.
+- **`claude_code` 바인딩(PPS-350):** `claude -p` 는 구독 로그인된 사용자 PC 에서만 돌고 컨테이너 · 공용
+  서버에 올리지 않는다. 코드는 토큰을 다루지 않고(`claude` 가 `~/.claude` 에서 스스로 읽음),
+  `--no-session-persistence` 로 세션 파일을 남기지 않으며, 로그에는 exit 코드 · `api_error_status` ·
+  stderr 앞 300자만 남긴다. 자식 env 에서 `ANTHROPIC_*`(API 키 · 인증 토큰 · BASE_URL · 커스텀 헤더 등
+  접두어 전체) · `CLAUDE_CODE_USE_*`(BEDROCK/VERTEX/FOUNDRY) · `AWS_BEARER_TOKEN_BEDROCK` · `CLAUDECODE`
+  와 인덱서 비밀 `SPECGRAPH_*` · `POSTGRES_*` 를 제거해 구독 경로만 탄다. **자식 프로세스는
+  `CLAUDE_CODE_OAUTH_TOKEN` 을 읽으므로(제거하지 않는다) 셸에 이 변수가 있으면 반드시 운영자 본인
+  토큰이어야 한다** — 다른 사용자의 구독을 쓰지 않는다. 결과 JSON 의
+  정확한 형태 · 종료 코드 · 429 응답은 실측 전이라 판정을 보수적으로 둔다(성공은 `type=result` ·
+  `subtype=success` · `is_error=false` · exit 0 일 때만, 한도 초과는 `api_error_status=429` ·
+  `api_error_code` 의 `429`, 또는 result · subtype · stderr · (JSON 이 아닌) stdout 평문의
+  `rate limit` · `usage limit` · `limit reached` · `hit your limit` 문구. stderr · result 의 숫자
+  `429` 만으로는 한도로 보지 않는다). 실측 뒤 형태가 다르면 판정 규칙만
+  좁힌다(§9). `~/.claude/CLAUDE.md`(사용자 전역 지시)는 cwd 와 무관하게 로드될 수 있어 호출당 수백
+  토큰이 더 들 수 있다 — `--bare` 없이는 끌 수 없으므로 수용한다(`--bare` 는 OAuth 를 끊어 구독
+  로그인이 무효가 된다). Claude Code 세션 안(Bash 도구)에서 인덱서를 돌리면 중첩 세션이 되므로
+  **일반 터미널에서 실행한다.**
+
+## 9. claude_code 바인딩 실측 (PPS-350 AC20 · AC21)
+
+큰 문서 1건(`settlr/prd/admin-prd.md`, 브랜치 `draft/settlr-admin-prd`)을 호스트에서 `claude -p` 로
+인덱싱해 호출 수 · 시간 · 한도 도달 여부를 잰다. **값은 실측 후 기입한다 — 이 절의 표가 비어 있으면
+AC20 · AC21 은 미실측이다.** 구독 한도에 걸리면 다음 창까지 기다리되 **다른 사용자의 구독을 쓰지 않는다.**
+
+### 9-1. smoke (실측 전 1회, 구독 소모 극소)
+
+일반 터미널에서 D1 플래그 그대로 짧은 프롬프트를 보내 ① 플래그가 모두 수용되는지(특히
+`--setting-sources ""`) ② 결과 JSON 의 `type` · `subtype` · `is_error` · `result` 형태 ③ 종료 코드를
+확인한다. 거부되는 플래그가 있으면 `llm.py::_claude_argv` 와 `tests/test_llm.py` 를 함께 고친다.
+
+```bash
+cd "$(mktemp -d)" && printf '%s' '한 단어로 답하라: 1+1=?' | \
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u ANTHROPIC_CUSTOM_HEADERS \
+      -u CLAUDE_CODE_USE_BEDROCK -u CLAUDE_CODE_USE_VERTEX -u CLAUDE_CODE_USE_FOUNDRY \
+      -u AWS_BEARER_TOKEN_BEDROCK -u CLAUDECODE \
+  claude -p --output-format json --model <LLM_MODEL> --tools "" --system-prompt '간결하게 답한다' \
+  --no-session-persistence --strict-mcp-config --disable-slash-commands --setting-sources ""; echo "exit=$?"
+```
+
+| 확인 항목 | 결과(실측 후 기입) |
+|---|---|
+| 종료 코드 | |
+| `type` / `subtype` / `is_error` | |
+| `result` 에 본문만 있는가(코드펜스 유무) | |
+| 거부된 플래그 | |
+
+### 9-2. 절차
+
+```bash
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env stop indexer   # advisory lock 충돌 방지
+set -a; source deploy/.env; set +a
+export POSTGRES_HOST=localhost EMBEDDING_BINDING_HOST=http://localhost:11434 \
+       RERANK_BINDING_HOST=http://localhost:7997/rerank
+export LLM_BINDING=claude_code LLM_MODEL=<Claude Code 모델 별칭 또는 ID>   # .env 의 qwen3:8b 를 덮어쓴다
+export SPECGRAPH_BRANCH_GLOB=draft/settlr-admin-prd                           # 대상을 한 브랜치로 한정
+uv run specgraph-indexer --once 2> run.log; echo "exit=$?"
+```
+
+집계:
+
+```bash
+grep -c 'event=chapter_sync' run.log                                   # 처리 챕터 수
+grep 'event=sync_done' run.log                                         # elapsed_s · llm_calls_total
+grep 'event=extract' run.log | awk '{for(i=1;i<=NF;i++) if($i ~ /^(screens|policies|section_refs|cross_doc_refs)=/){split($i,a,"="); s[a[1]]+=a[2]}} END{for(k in s) print k, s[k]}'
+grep -c 'event=llm_rate_limited' run.log                               # 0 이어야 한도 미도달
+grep 'event=branch_failed\|event=poll_rate_limited' run.log
+```
+
+### 9-3. 결과 (AC20 — 실측 후 기입)
+
+| 항목 | 값 | 비고 |
+|---|---|---|
+| 실측 일시 · 모델(`LLM_MODEL`) · `MAX_ASYNC` · `LLM_TIMEOUT` | | |
+| 처리 챕터 수(`chapter_sync` 수) | | |
+| 총 LLM 호출 수(`sync_done llm_calls_total`) | | |
+| 소요 시간(`sync_done elapsed_s`) | | |
+| 호출당 평균 시간(elapsed_s ÷ llm_calls_total) | | 프로세스 기동 오버헤드 포함 |
+| 한도 도달 여부(`llm_rate_limited` 건수 · 도달 시각 · 창 리셋 시각) | | |
+| `event=extract` 합계(screens · policies · section_refs · cross_doc_refs) | | M7 검토치와 비교 |
+| 실패 브랜치 · 종료 코드 | | |
+| 결과 JSON · 429 응답의 실제 형태(D3 판정 규칙 조정 필요 여부) | | |
+
+### 9-4. 결론 (AC21 — 실측 후 기입)
+
+- 구독 한도 안에서 초기 인덱싱(큰 문서 1건 → 전체 `draft/*`) 완료 여부: 
+- 권장 운영 방식 — PC 1대 · 구독 좌석 수 · `MAX_ASYNC` · `SPECGRAPH_POLL_INTERVAL_SECONDS` · 한도 창 대기 전략: 
+- Ollama(Qwen3-8B) 대비 한국어 추출 품질 · 속도 소견: 

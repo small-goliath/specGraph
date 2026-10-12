@@ -102,11 +102,37 @@ def test_missing_repo_url_raises_config_error(settings_env):
     assert "SPECGRAPH_REPO_URL" in str(exc.value)
 
 
-def test_missing_llm_model_raises_config_error(settings_env):
+def test_missing_llm_model_is_none_at_load(settings_env):
+    """PPS-350 D7: LLM_MODEL 은 선택값이다 — 요구는 LLM 함수를 만들 때(make_llm_func) 한다."""
     settings_env.delenv("LLM_MODEL")
 
-    with pytest.raises(ConfigError):
+    assert load_settings().llm_model is None
+
+
+def test_empty_llm_model_reads_as_none(settings_env):
+    """compose 의 빈 참조(``LLM_MODEL=``)를 재현 — 빈 문자열은 None 과 같다."""
+    settings_env.setenv("LLM_MODEL", "")
+
+    assert load_settings().llm_model is None
+
+
+def test_llm_binding_defaults_to_ollama(settings_env):
+    assert load_settings().llm_binding == "ollama"
+
+
+def test_llm_binding_claude_code_accepted(settings_env):
+    settings_env.setenv("LLM_BINDING", "claude_code")
+
+    assert load_settings().llm_binding == "claude_code"
+
+
+def test_unknown_llm_binding_raises_config_error(settings_env):
+    settings_env.setenv("LLM_BINDING", "bedrock")
+
+    with pytest.raises(ConfigError) as exc:
         load_settings()
+
+    assert "LLM_BINDING" in str(exc.value)
 
 
 def test_defaults_branch_glob_and_include_dirs(settings_env):

@@ -7,8 +7,6 @@
       "env": {
         "SPECGRAPH_REPO_URL": "${SPECGRAPH_REPO_URL:-https://github.com/df-planning-dev/product-docs.git}",
         "SPECGRAPH_LOG_LEVEL": "WARNING",
-        "LLM_MODEL": "${LLM_MODEL}",
-        "LLM_BINDING_HOST": "${LLM_BINDING_HOST:-http://localhost:11434}",
         "EMBEDDING_BINDING": "${EMBEDDING_BINDING:-ollama}",
         "EMBEDDING_MODEL": "${EMBEDDING_MODEL}",
         "EMBEDDING_DIM": "${EMBEDDING_DIM:-1024}",

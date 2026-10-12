@@ -27,22 +27,30 @@ def _record():
     )
 
 
-class Llm:
-    async def __call__(self, prompt, system_prompt=None, **_):
-        return "답변"
-
-
-@pytest.fixture
-def server():
+def _build():
     manifest = InMemoryManifest(
         records={ADM3: _record()}, heads={"draft/settlr-admin-prd": "sha-a"}
     )
     rag = FakeLightRAG(retrieval=Retrieval(chunks=[RetrievedChunk(ADM3, "운영자 화면")]))
 
     async def services() -> Services:
-        return Services(query=QueryService(rag, manifest, Llm()), lookup=LookupService(manifest))
+        return Services(query=QueryService(rag, manifest), lookup=LookupService(manifest))
 
-    return build_server(services)
+    return build_server(services), rag
+
+
+@pytest.fixture
+def server():
+    return _build()[0]
+
+
+def _accepts_nullable_string_array(prop: dict) -> bool:
+    options = prop.get("anyOf") or [prop]
+    has_array = any(
+        o.get("type") == "array" and o.get("items", {}).get("type") == "string" for o in options
+    )
+    nullable = any(o.get("type") == "null" for o in options) or "null" in str(prop.get("type"))
+    return has_array and nullable
 
 
 async def test_server_exposes_exactly_five_tools(server):
@@ -57,15 +65,12 @@ async def test_tool_signatures_match_ticket(server):
     async with Client(server) as client:
         tools = {t.name: t.input_schema for t in await client.list_tools()}
 
-    assert list(tools["query"]["properties"]) == ["question", "mode", "branch"]
-    assert tools["query"]["required"] == ["question"]
-    assert set(tools["query"]["properties"]["mode"]["enum"]) == {
-        "local",
-        "global",
-        "hybrid",
-        "naive",
-        "mix",
-    }
+    query = tools["query"]
+    assert list(query["properties"]) == ["question", "mode", "branch", "hl_keywords", "ll_keywords"]
+    assert query["required"] == ["question"]
+    assert set(query["properties"]["mode"]["enum"]) == {"local", "global", "hybrid", "naive", "mix"}
+    assert _accepts_nullable_string_array(query["properties"]["hl_keywords"])
+    assert _accepts_nullable_string_array(query["properties"]["ll_keywords"])
     assert list(tools["get_chapter"]["properties"]) == ["doc", "section"]
     assert list(tools["find_screen"]["properties"]) == ["id"]
     assert list(tools["find_policy"]["properties"]) == ["id"]
@@ -82,13 +87,32 @@ async def test_find_screen_tool_end_to_end_with_fakes(server):
     assert data["content"].startswith("## 3. ADM-03")
 
 
-async def test_query_tool_returns_sources_with_commit_sha(server):
+async def test_query_tool_returns_evidence_with_commit_sha_and_no_answer(server):
+    """PPS-350 AC14: query 응답은 answer 없이 청크 · 엔티티 · 관계 · 출처(doc_id · commit_sha)다."""
     async with Client(server) as client:
         result = await client.call_tool("query", {"question": "ADM-03 은?"})
 
     data = result.structured_content
-    assert data["answer"] == "답변"
+    assert "answer" not in data
     assert data["sources"] == [{"doc_id": ADM3, "commit_sha": "sha-a"}]
+    assert data["chunks"] == [
+        {"doc_id": ADM3, "commit_sha": "sha-a", "content": "운영자 화면", "expanded": False}
+    ]
+    assert data["entities"] == [] and data["relations"] == []
+    assert data["no_evidence"] is False
+
+
+async def test_query_tool_forwards_keywords_to_service():
+    """PPS-350 AC11: hl_keywords · ll_keywords 가 도구 → 서비스 → 포트까지 그대로 간다."""
+    server, rag = _build()
+
+    async with Client(server) as client:
+        await client.call_tool(
+            "query",
+            {"question": "ADM-03 은?", "hl_keywords": ["정산"], "ll_keywords": ["ADM-03"]},
+        )
+
+    assert rag.calls[0] == ("retrieve", "ADM-03 은?", "mix", ("정산",), ("ADM-03",))
 
 
 async def test_lookup_tools_include_doc_id_and_commit_sha(server):
@@ -129,18 +153,18 @@ async def test_service_initialization_failure_becomes_clear_tool_error():
     from specgraph.mcp_server.server import _call
 
     async def broken() -> Services:
-        raise ConfigError("환경변수 설정 오류 — LLM_MODEL: Field required")
+        raise ConfigError("환경변수 설정 오류 — SPECGRAPH_REPO_URL: Field required")
 
     lazy_server = build_server(broken)
     async with Client(lazy_server) as client:
         result = await client.call_tool("list_docs", {}, raise_on_error=False)
 
     assert result.is_error
-    assert "LLM_MODEL" in result.content[0].text
+    assert "SPECGRAPH_REPO_URL" in result.content[0].text
 
     from specgraph.mcp_server.server import _Lazy
 
-    with pytest.raises(ToolError, match="LLM_MODEL"):
+    with pytest.raises(ToolError, match="SPECGRAPH_REPO_URL"):
         await _call(_Lazy(broken), lambda s: s.lookup.list_docs())
 
 
@@ -171,7 +195,7 @@ async def test_services_are_closed_when_server_shuts_down():
 
     async def services() -> Services:
         return Services(
-            query=QueryService(FakeLightRAG(), manifest, Llm()),
+            query=QueryService(FakeLightRAG(), manifest),
             lookup=LookupService(manifest),
             close=close,
         )
@@ -208,6 +232,45 @@ async def test_real_services_closes_manifest_when_lightrag_init_fails(settings_e
         await entry.real_services()
 
     assert FakeManifest.closed
+
+
+async def test_real_services_builds_query_service_without_llm_model(settings_env, monkeypatch):
+    """PPS-350 AC17 · D8: MCP 는 LLM_MODEL 없이 뜨고, LightRAG 에는 비활성 LLM 스텁을 넘긴다."""
+    from specgraph.errors import LlmError
+    from specgraph.lightrag_store import LightRagStore
+    from specgraph.manifest import PostgresManifest
+    from specgraph.mcp_server import __main__ as entry
+
+    settings_env.delenv("LLM_MODEL")
+    settings_env.delenv("LLM_BINDING_HOST", raising=False)
+    captured = {}
+
+    class FakeManifest:
+        async def close(self):
+            pass
+
+    class FakeStore:
+        async def close(self):
+            pass
+
+    async def create_manifest(dsn, schema="specgraph"):
+        return FakeManifest()
+
+    async def create_store(settings, counter, **overrides):
+        captured.update(overrides)
+        return FakeStore()
+
+    monkeypatch.setattr(PostgresManifest, "create", staticmethod(create_manifest))
+    monkeypatch.setattr(LightRagStore, "create", staticmethod(create_store))
+
+    services = await entry.real_services()
+
+    assert captured["llm_model_name"] == "disabled"
+    with pytest.raises(LlmError):
+        await captured["llm_model_func"]("p", system_prompt="s")
+    assert isinstance(services.query, QueryService)
+    assert isinstance(services.query.rag, FakeStore)
+    assert not hasattr(services.query, "llm")
 
 
 def test_stdio_entrypoint_is_registered_as_script():

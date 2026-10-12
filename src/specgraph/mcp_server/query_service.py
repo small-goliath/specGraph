@@ -1,11 +1,16 @@
-"""질의 서비스 (AC15 · AC16 · AC17).
+"""질의 서비스 — 근거 반환 전용 (AC15 · AC16 · AC17, PPS-350 AC11~AC16).
 
-1. LightRAG 구조화 검색(``aquery_data`` — LLM 생성 없이 근거만)으로 청크 · 엔티티 · 관계를 얻는다.
+1. 호출자(Claude Code)가 넘긴 ``hl_keywords`` · ``ll_keywords`` 로 LightRAG 구조화 검색
+   (``aquery_data`` — LLM 생성 없이 근거만)을 해 청크 · 엔티티 · 관계를 얻는다. 키워드가 있으면
+   LightRAG 는 LLM 키워드 추출을 건너뛰고, 둘 다 비면 어댑터가 질의문을 ``ll_keywords`` 로 쓴다.
+   **질의 경로의 LLM 호출은 0 건이다** — 이 서비스는 LLM 을 갖지 않는다.
 2. branch 가 주어지면 doc_id 접두어(``<branch>:``)로 모든 근거를 거른다.
 3. 검색된 챕터의 결정적 참조(REFERS_TO — "Admin PRD §5", "§5.2")를 한 단계 따라가
-   참조 대상 챕터를 근거에 추가한다(branch 필터가 있으면 그 브랜치 안에서만).
-4. 걸러진 근거만으로 LLM 이 한국어 답변을 만든다.
-5. 모든 출처에 doc_id 와 manifest 의 commit_sha 를 붙인다.
+   참조 대상 챕터를 ``expanded=True`` 청크로 추가한다(branch 필터가 있으면 그 브랜치 안에서만).
+4. 숨긴 챕터(PENDING 첫 삽입)는 청크에서 빼고, 엔티티 · 관계는 보이는 출처만 ``sources`` 에
+   붙이며 보이는 출처가 하나도 없으면 뺀다.
+5. 모든 항목에 doc_id 와 manifest 의 commit_sha 를 붙인다. 근거가 없으면 빈 목록 +
+   ``no_evidence=True`` 로 정상 반환한다(오류 아님). 답변 생성은 호출자의 몫이다.
 """
 
 from __future__ import annotations
@@ -16,17 +21,9 @@ from typing import Any
 from specgraph.docid import belongs_to_branch, parse_doc_id
 from specgraph.errors import InvalidArgumentError
 from specgraph.lightrag_store import QUERY_MODES, LightRagPort, Retrieval
-from specgraph.llm import LlmFunc
 from specgraph.manifest import ChapterRecord, ManifestPort
 
-NO_EVIDENCE_ANSWER = "질문과 관련된 근거 문서를 찾지 못했다."
 EXPANDED_CHAPTER_CHARS = 4000
-
-SYSTEM_PROMPT = (
-    "너는 product-docs 기획 문서(PRD · UI/UX spec · tech-spec)에 대한 질문에 답하는 도우미다. "
-    "아래 '근거'에 있는 내용만 사용해 한국어로 답하라. 근거에 없는 내용은 추측하지 말고 "
-    "모른다고 답하라. 문장마다 근거의 doc_id 를 [doc_id] 형식으로 인용하라."
-)
 
 
 @dataclass(frozen=True)
@@ -38,18 +35,74 @@ class Source:
         return {"doc_id": self.doc_id, "commit_sha": self.commit_sha}
 
 
-@dataclass
-class QueryResult:
-    answer: str
-    sources: list[Source] = field(default_factory=list)
-    mode: str = "mix"
-    branch: str | None = None
+@dataclass(frozen=True)
+class EvidenceChunk:
+    doc_id: str
+    commit_sha: str
+    content: str
+    expanded: bool = False  # 검색 결과가 아니라 참조 확장(REFERS_TO)으로 덧붙인 챕터 본문
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "answer": self.answer,
+            "doc_id": self.doc_id,
+            "commit_sha": self.commit_sha,
+            "content": self.content,
+            "expanded": self.expanded,
+        }
+
+
+@dataclass(frozen=True)
+class EvidenceEntity:
+    name: str
+    entity_type: str
+    description: str
+    sources: tuple[Source, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "entity_type": self.entity_type,
+            "description": self.description,
+            "sources": [s.to_dict() for s in self.sources],
+        }
+
+
+@dataclass(frozen=True)
+class EvidenceRelation:
+    src: str
+    tgt: str
+    keywords: str
+    description: str
+    sources: tuple[Source, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "src": self.src,
+            "tgt": self.tgt,
+            "keywords": self.keywords,
+            "description": self.description,
+            "sources": [s.to_dict() for s in self.sources],
+        }
+
+
+@dataclass
+class QueryResult:
+    chunks: list[EvidenceChunk] = field(default_factory=list)
+    entities: list[EvidenceEntity] = field(default_factory=list)
+    relations: list[EvidenceRelation] = field(default_factory=list)
+    sources: list[Source] = field(default_factory=list)
+    mode: str = "mix"
+    branch: str | None = None
+    no_evidence: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
             "mode": self.mode,
             "branch": self.branch,
+            "no_evidence": self.no_evidence,
+            "chunks": [c.to_dict() for c in self.chunks],
+            "entities": [e.to_dict() for e in self.entities],
+            "relations": [r.to_dict() for r in self.relations],
             "sources": [s.to_dict() for s in self.sources],
         }
 
@@ -60,6 +113,10 @@ def _is_chapter_id(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _clean_keywords(keywords: list[str] | None) -> list[str]:
+    return [k.strip() for k in (keywords or ()) if k and k.strip()]
 
 
 def _filter(retrieval: Retrieval, branch: str | None) -> Retrieval:
@@ -82,13 +139,17 @@ def _filter(retrieval: Retrieval, branch: str | None) -> Retrieval:
 
 
 class QueryService:
-    def __init__(self, rag: LightRagPort, manifest: ManifestPort, llm: LlmFunc) -> None:
+    def __init__(self, rag: LightRagPort, manifest: ManifestPort) -> None:
         self.rag = rag
         self.manifest = manifest
-        self.llm = llm
 
     async def query(
-        self, question: str, mode: str = "mix", branch: str | None = None
+        self,
+        question: str,
+        mode: str = "mix",
+        branch: str | None = None,
+        hl_keywords: list[str] | None = None,
+        ll_keywords: list[str] | None = None,
     ) -> QueryResult:
         if mode not in QUERY_MODES:
             raise InvalidArgumentError(
@@ -98,7 +159,15 @@ class QueryService:
             raise InvalidArgumentError("question 이 비어 있다")
         branch = branch or None
 
-        retrieval = _filter(await self.rag.retrieve(question, mode), branch)
+        retrieval = _filter(
+            await self.rag.retrieve(
+                question,
+                mode,
+                hl_keywords=_clean_keywords(hl_keywords),
+                ll_keywords=_clean_keywords(ll_keywords),
+            ),
+            branch,
+        )
 
         retrieved_ids: list[str] = []
         for doc_id in (
@@ -129,40 +198,37 @@ class QueryService:
                     expanded.append(target)
                     records[target] = record
 
+        def visible_sources(doc_ids: tuple[str, ...]) -> tuple[Source, ...]:
+            return tuple(Source(d, records[d].commit_sha) for d in doc_ids if d in records)
+
+        chunks = [
+            EvidenceChunk(c.doc_id, records[c.doc_id].commit_sha, c.content)
+            for c in retrieval.chunks
+            if c.doc_id in records
+        ]
+        chunks.extend(
+            EvidenceChunk(
+                d, records[d].commit_sha, records[d].content[:EXPANDED_CHAPTER_CHARS], expanded=True
+            )
+            for d in expanded
+        )
+        entities = [
+            EvidenceEntity(e.name, e.entity_type, e.description, sources)
+            for e in retrieval.entities
+            if (sources := visible_sources(e.doc_ids))
+        ]
+        relations = [
+            EvidenceRelation(r.src, r.tgt, r.keywords, r.description, sources)
+            for r in retrieval.relations
+            if (sources := visible_sources(r.doc_ids))
+        ]
         ordered = [d for d in retrieved_ids if d in records] + expanded
-        sources = [Source(d, records[d].commit_sha) for d in ordered]
-        if not sources:
-            return QueryResult(answer=NO_EVIDENCE_ANSWER, sources=[], mode=mode, branch=branch)
-
-        prompt = self._prompt(question, retrieval, ordered, expanded, records)
-        answer = await self.llm(prompt, system_prompt=SYSTEM_PROMPT)
-        return QueryResult(answer=answer, sources=sources, mode=mode, branch=branch)
-
-    @staticmethod
-    def _prompt(
-        question: str,
-        retrieval: Retrieval,
-        ordered: list[str],
-        expanded: list[str],
-        records: dict[str, ChapterRecord],
-    ) -> str:
-        parts = ["## 근거"]
-        for doc_id in ordered:
-            if doc_id in expanded:
-                body = records[doc_id].content[:EXPANDED_CHAPTER_CHARS]
-            else:
-                body = "\n\n".join(c.content for c in retrieval.chunks if c.doc_id == doc_id)
-                body = body or records[doc_id].content[:EXPANDED_CHAPTER_CHARS]
-            parts.append(f"### [{doc_id}] {records[doc_id].title}\n{body}")
-        if retrieval.entities:
-            parts.append("## 관련 엔티티")
-            parts.extend(
-                f"- {e.name} ({e.entity_type}): {e.description}" for e in retrieval.entities
-            )
-        if retrieval.relations:
-            parts.append("## 관련 관계")
-            parts.extend(
-                f"- {r.src} → {r.tgt} [{r.keywords}]: {r.description}" for r in retrieval.relations
-            )
-        parts.append(f"## 질문\n{question}")
-        return "\n\n".join(parts)
+        return QueryResult(
+            chunks=chunks,
+            entities=entities,
+            relations=relations,
+            sources=[Source(d, records[d].commit_sha) for d in ordered],
+            mode=mode,
+            branch=branch,
+            no_evidence=not (chunks or entities or relations),
+        )
